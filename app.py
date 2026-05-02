@@ -494,6 +494,28 @@ def update_user_last_processed_files(
     )
 
 
+def _get_last_shapefile_doc(user: dict[str, Any]) -> dict[str, Any] | None:
+    last_files = user.get("last_processed_files") or {}
+    shapefile_id = last_files.get("shapefile_id")
+    collection = get_shapefiles_collection()
+    if shapefile_id:
+        doc = collection.find_one({"_id": ObjectId(shapefile_id)})
+        if doc:
+            return doc
+    return collection.find_one({"user_id": str(user["_id"])}, sort=[("created_at", -1)])
+
+
+def _get_last_temporal_doc(user: dict[str, Any]) -> dict[str, Any] | None:
+    last_files = user.get("last_processed_files") or {}
+    temporal_ids = last_files.get("temporal_feature_ids") or []
+    collection = get_temporal_collection()
+    if temporal_ids:
+        doc = collection.find_one({"_id": ObjectId(temporal_ids[0])})
+        if doc:
+            return doc
+    return collection.find_one({"user_id": str(user["_id"])}, sort=[("created_at", -1)])
+
+
 def process_reflectance_pair(rgb_path: Path, nir_path: Path, band_mapping: dict,
                               shapefile_geojson: dict, timestamp_label: str,
                               out_dir: Path) -> Path:
@@ -983,6 +1005,50 @@ def session_info(session_id: str) -> JSONResponse:
         "timestamp_count": sess.get("timestamp_count", 0),
         "timestamp_labels": sess.get("timestamp_labels", []),
         "has_shapefile": sess.get("geojson") is not None,
+    })
+
+
+@app.get("/user/last-upload/geojson", response_model=None)
+def user_last_upload_geojson(request: Request) -> JSONResponse:
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    doc = _get_last_shapefile_doc(user)
+    if not doc:
+        raise HTTPException(status_code=404, detail="No shapefile uploaded")
+    geojson_data = doc.get("geojson")
+    if not geojson_data:
+        raise HTTPException(status_code=404, detail="No shapefile data")
+    return JSONResponse(geojson_data)
+
+
+@app.get("/user/last-upload/temporal-csv")
+def user_last_upload_temporal_csv(request: Request) -> StreamingResponse:
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    doc = _get_last_temporal_doc(user)
+    if not doc:
+        raise HTTPException(status_code=404, detail="No temporal dataset uploaded")
+    records = doc.get("records") or []
+    if not records:
+        raise HTTPException(status_code=404, detail="No temporal dataset records")
+    frame = pd.DataFrame(records)
+    csv_text = frame.to_csv(index=False)
+    buffer = io.BytesIO(csv_text.encode("utf-8"))
+    return StreamingResponse(buffer, media_type="text/csv")
+
+
+@app.get("/user/last-upload/info")
+def user_last_upload_info(request: Request) -> JSONResponse:
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    doc = _get_last_temporal_doc(user)
+    if not doc:
+        raise HTTPException(status_code=404, detail="No upload found")
+    return JSONResponse({
+        "session_id": doc.get("session_id"),
     })
 
 
