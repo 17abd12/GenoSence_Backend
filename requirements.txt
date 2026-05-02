@@ -3,6 +3,12 @@ uvicorn[standard]==0.29.0
 pandas
 numpy
 scipy
+pyjwt
+passlib[bcrypt]
+bcrypt==3.2.2
+pymongo
+boto3
+python-multipart
 openai
 python-dotenv
 python-multipart
