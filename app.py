@@ -402,18 +402,26 @@ def delete_user_upload_data(user_id: str) -> None:
 
 
 def store_temporal_features(user_id: str, session_id: str, temporal_df: pd.DataFrame) -> list[str]:
+    """Upsert: one temporal-features document per user."""
     collection = get_temporal_collection()
     records = temporal_df.to_dict(orient="records")
     if not records:
         return []
-    doc = {
-        "user_id": user_id,
-        "session_id": session_id,
-        "records": records,
-        "created_at": datetime.now(tz=timezone.utc).isoformat(),
-    }
-    result = collection.insert_one(doc)
-    return [str(result.inserted_id)]
+    now = datetime.now(tz=timezone.utc).isoformat()
+    result = collection.update_one(
+        {"user_id": user_id},
+        {"$set": {
+            "user_id": user_id,
+            "session_id": session_id,
+            "records": records,
+            "updated_at": now,
+        }, "$setOnInsert": {"created_at": now}},
+        upsert=True,
+    )
+    if result.upserted_id:
+        return [str(result.upserted_id)]
+    doc = collection.find_one({"user_id": user_id}, {"_id": 1})
+    return [str(doc["_id"])] if doc else []
 
 
 def _extract_date_label(name: str) -> str:
@@ -455,16 +463,24 @@ def store_shapefile_geojson(
     geojson_data: dict[str, Any],
     filename: str | None,
 ) -> str:
+    """Upsert: one shapefile document per user."""
     collection = get_shapefiles_collection()
-    doc = {
-        "user_id": user_id,
-        "session_id": session_id,
-        "filename": filename,
-        "geojson": geojson_data,
-        "created_at": datetime.now(tz=timezone.utc).isoformat(),
-    }
-    result = collection.insert_one(doc)
-    return str(result.inserted_id)
+    now = datetime.now(tz=timezone.utc).isoformat()
+    result = collection.update_one(
+        {"user_id": user_id},
+        {"$set": {
+            "user_id": user_id,
+            "session_id": session_id,
+            "filename": filename,
+            "geojson": geojson_data,
+            "updated_at": now,
+        }, "$setOnInsert": {"created_at": now}},
+        upsert=True,
+    )
+    if result.upserted_id:
+        return str(result.upserted_id)
+    doc = collection.find_one({"user_id": user_id}, {"_id": 1})
+    return str(doc["_id"]) if doc else ""
 
 
 def update_user_last_processed_files(
@@ -758,17 +774,47 @@ async def upload_temporal_csvs(
     # Process each timestamp pixel CSV → STATS CSV
     processed_labels: list[str] = []
     errors: list[str] = []
+    warnings_list: list[str] = []
 
     for i, ts_file in enumerate(timestamp_csvs):
-        label = f"t{i+1}"
+        label = _extract_date_label(ts_file.filename or f"t{i+1}")
+        if not label:
+            label = f"t{i+1}"
         try:
             ts_bytes = await ts_file.read()
-            pixel_path = tmp_dir / f"pixels_{i}.csv"
-            pixel_path.write_bytes(ts_bytes)
-            stats_df = compute_vi_stats(pixel_path)
-            out_name = f"final_{label}_STATS.csv"
-            stats_df.to_csv(ts_dir / out_name, index=False)
-            processed_labels.append(label)
+            df_ts = pd.read_csv(io.BytesIO(ts_bytes))
+            df_ts.columns = df_ts.columns.str.strip()
+
+            # Detect format: does this CSV already have pre-computed _mean stats?
+            has_precomputed = any(c.endswith("_mean") for c in df_ts.columns)
+            has_plot_id = "PLOT_ID" in df_ts.columns
+
+            if has_precomputed and has_plot_id:
+                # Format B: already-computed VI stats (e.g. sample timestamp files)
+                # Write directly as STATS CSV
+                out_name = f"final_{label}_STATS.csv"
+                df_ts.to_csv(ts_dir / out_name, index=False)
+                processed_labels.append(label)
+                warnings_list.append(
+                    f"Timestamp {i+1} ({ts_file.filename}): used pre-computed VI stats directly."
+                )
+            else:
+                # Format A: raw pixel CSV — try to compute VIs
+                required_band_cols = {"Red", "Green", "Blue", "NIR", "Rededge"}
+                missing = required_band_cols - set(df_ts.columns)
+                if missing:
+                    errors.append(
+                        f"Timestamp {i+1} ({ts_file.filename}): CSV missing columns: {missing}. "
+                        "Upload either raw pixel CSVs (Red/Green/Blue/NIR/Rededge) or pre-computed STATS CSVs (_mean columns)."
+                    )
+                    continue
+                pixel_path = tmp_dir / f"pixels_{i}.csv"
+                pixel_path.write_bytes(ts_bytes)
+                from analysis_helpers import compute_vi_stats  # type: ignore[import]
+                stats_df = compute_vi_stats(pixel_path)
+                out_name = f"final_{label}_STATS.csv"
+                stats_df.to_csv(ts_dir / out_name, index=False)
+                processed_labels.append(label)
         except Exception as exc:
             errors.append(f"Timestamp {i+1} ({ts_file.filename}): {exc}")
 
@@ -835,6 +881,7 @@ async def upload_temporal_csvs(
         "processed_timestamps": len(processed_labels),
         "timestamp_labels": processed_labels,
         "errors": errors,
+        "warnings": warnings_list,
         "has_shapefile": geojson_path is not None,
         "message": "Temporal CSVs processed. Use session_id in analysis requests.",
     })
@@ -980,6 +1027,96 @@ async def upload_temporal_csv_only(
 
 
 # ─────────────────────────────────────────────────────────────────
+# Upload: Mode D – Shapefile only (visualize on map)
+# ─────────────────────────────────────────────────────────────────
+
+@app.post("/upload/shapefile-only")
+async def upload_shapefile_only(
+    request: Request,
+    shapefile_json: UploadFile = File(..., description="Shapefile as GeoJSON"),
+) -> JSONResponse:
+    """
+    Accept a GeoJSON shapefile and store it for map visualization.
+    Creates a minimal temporal CSV (PLOT_ID + genotype) from the shapefile
+    properties so the session can be used for other endpoints without crashing.
+    """
+    import json as json_module
+
+    session_id = str(uuid.uuid4())
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"session_{session_id}_"))
+    ts_dir = tmp_dir / "timestamps"
+    ts_dir.mkdir()
+
+    geojson_bytes = await shapefile_json.read()
+    try:
+        geojson_data = json_module.loads(geojson_bytes.decode("utf-8"))
+    except Exception as exc:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(400, f"Invalid GeoJSON: {exc}")
+
+    feature_count = len(geojson_data.get("features", []))
+    geojson_path = tmp_dir / "plots.geojson"
+    geojson_path.write_text(json_module.dumps(geojson_data))
+
+    # Build minimal temporal CSV from shapefile feature properties
+    rows = []
+    for feat in geojson_data.get("features", []):
+        props = feat.get("properties", {})
+        plot_id = str(props.get("PLOT_ID", props.get("plot_id", props.get("Plot_ID", ""))))
+        raw_geno = props.get("genotype", props.get("GENOTYPE", ""))
+        if raw_geno not in (None, ""):
+            genotype = raw_geno
+        elif "_" in plot_id:
+            genotype = plot_id.split("_")[-1]
+        else:
+            genotype = 0
+        rows.append({"PLOT_ID": plot_id, "genotype": genotype})
+
+    temporal_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["PLOT_ID", "genotype"])
+    temporal_path = tmp_dir / "temporalDataSet.csv"
+    temporal_df.to_csv(temporal_path, index=False)
+
+    _sessions[session_id] = {
+        "temporal_csv": temporal_path,
+        "timestamps_dir": ts_dir,
+        "geojson": geojson_path,
+        "mode": "shapefile-only",
+        "timestamp_count": 0,
+        "timestamp_labels": [],
+    }
+    analysis.invalidate_session_cache(session_id)
+
+    user = get_current_user(request)
+    shapefile_id = None
+    if user:
+        user_id = str(user["_id"])
+        ensure_user_r2_prefix(user_id)
+        shapefile_key = None
+        temporal_ids: list[str] = []
+        try:
+            shapefile_key = upload_bytes_to_r2(user_id, geojson_bytes, shapefile_json.filename)
+        except Exception:
+            pass
+        try:
+            delete_user_upload_data(user_id)
+            temporal_ids = store_temporal_features(user_id, session_id, temporal_df)
+            shapefile_id = store_shapefile_geojson(user_id, session_id, geojson_data, shapefile_json.filename)
+        except Exception as exc:
+            print(f"/upload/shapefile-only: Mongo write failed: {exc}")
+        update_user_last_processed_files(
+            user_id, None, shapefile_key, [], [],
+            temporal_ids=temporal_ids, shapefile_id=shapefile_id,
+        )
+
+    return JSONResponse({
+        "session_id": session_id,
+        "feature_count": feature_count,
+        "has_shapefile": True,
+        "message": f"Shapefile loaded with {feature_count} features. Redirect to dashboard to visualize.",
+    })
+
+
+# ─────────────────────────────────────────────────────────────────
 # Session GeoJSON endpoint
 # ─────────────────────────────────────────────────────────────────
 
@@ -1052,11 +1189,26 @@ def user_last_upload_info(request: Request) -> JSONResponse:
     })
 
 
+@app.post("/user/reset-upload")
+def reset_user_upload(request: Request) -> JSONResponse:
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        delete_user_upload_data(str(user["_id"]))
+        update_user_last_processed_files(str(user["_id"]), None, None, [], [])
+        return JSONResponse({"message": "User upload data reset successfully. Dashboard will now show sample data."})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ─────────────────────────────────────────────────────────────────
 # Helper: resolve analysis engine for session or default
 # ─────────────────────────────────────────────────────────────────
 
 def _resolve_engine(session_id: str | None) -> analysis.AnalysisEngine:
+    import json as _json, tempfile as _tmp
+    # 1. Session is alive in memory
     if session_id and session_id in _sessions:
         sess = _sessions[session_id]
         return analysis.AnalysisEngine(
@@ -1064,6 +1216,41 @@ def _resolve_engine(session_id: str | None) -> analysis.AnalysisEngine:
             timestamps_dir=sess["timestamps_dir"],
             session_id=session_id,
         )
+    # 2. Session ID provided but server restarted — try to rebuild from MongoDB
+    if session_id and mongo_client:
+        try:
+            temporal_doc = get_temporal_collection().find_one({"session_id": session_id})
+            shapefile_doc = get_shapefiles_collection().find_one({"session_id": session_id})
+            if temporal_doc:
+                tmp_dir = Path(_tmp.mkdtemp(prefix=f"restore_{session_id}_"))
+                ts_dir = tmp_dir / "timestamps"
+                ts_dir.mkdir()
+                records = temporal_doc.get("records", [])
+                temporal_df = pd.DataFrame(records) if records else pd.DataFrame()
+                temporal_path = tmp_dir / "temporalDataSet.csv"
+                temporal_df.to_csv(temporal_path, index=False)
+                geojson_path: Path | None = None
+                if shapefile_doc:
+                    geojson_path = tmp_dir / "plots.geojson"
+                    geojson_path.write_text(_json.dumps(shapefile_doc.get("geojson", {})))
+                _sessions[session_id] = {
+                    "temporal_csv": temporal_path,
+                    "timestamps_dir": ts_dir,
+                    "geojson": geojson_path,
+                    "mode": "restored",
+                    "timestamp_count": 0,
+                    "timestamp_labels": [],
+                }
+                analysis.invalidate_session_cache(session_id)
+                print(f"_resolve_engine: restored session {session_id} from MongoDB")
+                return analysis.AnalysisEngine(
+                    temporal_csv=temporal_path,
+                    timestamps_dir=ts_dir,
+                    session_id=session_id,
+                )
+        except Exception as exc:
+            print(f"_resolve_engine: MongoDB restore failed for {session_id}: {exc}")
+    # 3. No session — fall back to user's last upload, then sample data
     return analysis.default_engine
 
 

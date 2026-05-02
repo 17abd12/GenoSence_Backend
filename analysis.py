@@ -102,10 +102,18 @@ class AnalysisEngine:
         if "temporal" not in self._cache:
             df = pd.read_csv(self._temporal_csv)
             df.columns = df.columns.str.strip()
+            # Normalize case-insensitive Yield → 'Yield'
+            for col in list(df.columns):
+                if col.lower() == "yield" and col != "Yield":
+                    df = df.rename(columns={col: "Yield"})
+                    break
             # ensure numeric genotype & Yield if present
             for col in ("genotype", "Yield"):
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
+            # Add placeholder Yield if absent (analyses degrade gracefully)
+            if "Yield" not in df.columns:
+                df["Yield"] = np.nan
             self._cache["temporal"] = df
         return self._cache["temporal"].copy()
 
@@ -149,24 +157,35 @@ class AnalysisEngine:
         counts = df["genotype"].value_counts()
         eligible = counts[counts >= 3].index
         filtered = df[df["genotype"].isin(eligible)].copy()
-        stab = (
-            filtered.groupby("genotype")
-            .agg(my=("Yield","mean"), sy=("Yield","std"))
-            .assign(cv=lambda x: (x["sy"] / x["my"].abs()) * 100)
-        )
-        stable_genos = stab[stab["cv"] < 25].index
-        stable = filtered[filtered["genotype"].isin(stable_genos)].copy()
-        if stable.empty:
+        if filtered.empty:
+            filtered = df.copy()
+        has_yield = filtered["Yield"].notna().any()
+        if has_yield:
+            stab = (
+                filtered.groupby("genotype")
+                .agg(my=("Yield", "mean"), sy=("Yield", "std"))
+                .assign(cv=lambda x: (x["sy"] / x["my"].abs().replace(0, np.nan)) * 100)
+            )
+            stable_genos = stab[stab["cv"].fillna(100) < 25].index
+            stable = filtered[filtered["genotype"].isin(stable_genos)].copy()
+            if stable.empty:
+                stable = filtered.copy()
+        else:
             stable = filtered.copy()
-        # Exclude groupby key from num_cols to avoid duplicate column on reset_index
         num_cols = [
             c for c in stable.select_dtypes(include=np.number).columns.tolist()
             if c != "genotype"
         ]
         gm = stable.groupby("genotype")[num_cols].mean().reset_index()
-        t33 = float(np.percentile(gm["Yield"].dropna(), 33))
-        t66 = float(np.percentile(gm["Yield"].dropna(), 66))
-        gm["Yield_Class"] = gm["Yield"].apply(lambda y: _yield_class(y, t33, t66))
+        yield_vals = gm["Yield"].dropna()
+        if len(yield_vals) >= 2:
+            t33 = float(np.percentile(yield_vals, 33))
+            t66 = float(np.percentile(yield_vals, 66))
+        else:
+            t33 = t66 = float(gm["Yield"].mean()) if has_yield else 0.0
+        gm["Yield_Class"] = gm["Yield"].apply(
+            lambda y: _yield_class(y, t33, t66) if pd.notna(y) else "Unknown"
+        )
         return filtered, gm, t33, t66
 
     # ── public API ─────────────────────────────────────────────────────────────
@@ -395,123 +414,157 @@ class AnalysisEngine:
         return {"category_summary":_df_to_records(cat_sum),"heatmap_matrix":_df_to_records(hm)}
 
     def get_yield_prediction(self) -> dict:
-        """Yield prediction using SVR (svr_combined.pkl) if loadable, else OLS fallback."""
+        """
+        Per-plot yield prediction.
+        - If 'Yield' column exists → use as actual; also predict with model.
+        - If absent → predict only; actual_yield shown as null.
+        Returns per-plot rows + feature null summary.
+        """
         df = self._load_temporal()
+        has_actual_yield = df["Yield"].notna().any()
         _, gm, _, _ = self._prepare(df)
 
-        # ── collect candidate feature columns ──────────────────────────────────
-        # Use all numeric columns from temporal CSV except identifiers & Yield
-        exclude = {"genotype", "Yield", "PLOT_ID", "experiment"}
+        # ── candidate feature columns ─────────────────────────────────────────
+        exclude = {"genotype", "Yield", "PLOT_ID", "experiment", "Yield_Class"}
         candidate_cols = [
-            c for c in gm.columns
-            if c not in exclude and pd.api.types.is_numeric_dtype(gm[c])
+            c for c in df.columns
+            if c not in exclude and pd.api.types.is_numeric_dtype(df[c])
         ]
 
-        if not candidate_cols or "Yield" not in gm.columns:
-            return {"predictions":[], "feature_importances":[], "r2":None,
-                    "model_used":"none", "message":"Insufficient feature data"}
+        # Feature null summary — one row per feature, shows null counts per plot
+        feature_null_summary: list[dict] = []
+        for col in candidate_cols:
+            null_n = int(df[col].isna().sum())
+            feature_null_summary.append({
+                "feature": col,
+                "total_plots": len(df),
+                "null_count": null_n,
+                "null_pct": round(100.0 * null_n / max(len(df), 1), 1),
+                "note": "null" if null_n == len(df) else ("partial nulls" if null_n > 0 else "ok"),
+            })
 
-        sub = gm[["genotype", "Yield", "Yield_Class"] + candidate_cols].dropna(subset=["Yield"])
-        if len(sub) < 5:
-            return {"predictions":[], "feature_importances":[], "r2":None,
-                    "model_used":"none", "message":"Not enough genotypes (< 5)"}
+        # ── per-PLOT prediction ───────────────────────────────────────────────
+        # Work at plot level so user sees Plot 1 → actual/predicted yield
+        plot_id_col = "PLOT_ID" if "PLOT_ID" in df.columns else None
+        work = df.copy()
 
-        X_df = sub[candidate_cols].fillna(sub[candidate_cols].mean())
-        y = sub["Yield"].values
+        if not candidate_cols:
+            # No features at all — just echo the plots with null predictions
+            preds = []
+            for _, row in work.iterrows():
+                preds.append({
+                    "plot_id": str(row.get("PLOT_ID", "")),
+                    "genotype": _safe_float(row.get("genotype")),
+                    "actual_yield": _safe_float(row["Yield"]) if has_actual_yield else None,
+                    "predicted_yield": None,
+                    "Yield_Class": "Unknown",
+                })
+            return {
+                "predictions": preds,
+                "feature_importances": [],
+                "feature_null_summary": feature_null_summary,
+                "r2": None,
+                "n_plots": len(df),
+                "n_genotypes": int(df["genotype"].nunique()),
+                "model_used": "none",
+                "has_actual_yield": has_actual_yield,
+                "message": "No numeric feature columns found — predictions shown as null.",
+            }
 
-        # ── try loading SVR pickle ─────────────────────────────────────────────
-        svr_path = Path(__file__).resolve().parent / "svr_combined.pkl"
-        model_used = "ols_fallback"
-        # Initialize defaults so they are always defined
-        y_pred = np.zeros(len(sub))
+        X_df = work[candidate_cols].copy()
+        col_means = X_df.mean()
+        X_filled = X_df.fillna(col_means)  # fill nulls with column mean for prediction
+
+        y_actual = work["Yield"].values  # may be NaN if no yield
+        # For model training we need rows with actual yield
+        has_y_mask = ~np.isnan(y_actual.astype(float))
+
+        model_used = "none"
         importances: list[dict] = []
+        y_pred = np.full(len(work), np.nan)
 
+        # ── try SVR ──────────────────────────────────────────────────────────
+        svr_path = Path(__file__).resolve().parent / "svr_combined.pkl"
         svr_loaded = False
         if svr_path.exists():
             try:
                 with open(svr_path, "rb") as fh:
                     svr_model = pickle.load(fh)
-                # Align features: use only columns the model knows, fill missing with 0
                 if hasattr(svr_model, "feature_names_in_"):
                     feat_names = list(svr_model.feature_names_in_)
-                    X_svr = X_df.reindex(columns=feat_names, fill_value=0).values
                 elif hasattr(svr_model, "named_steps"):
                     first = list(svr_model.named_steps.values())[0]
-                    if hasattr(first, "feature_names_in_"):
-                        feat_names = list(first.feature_names_in_)
-                        X_svr = X_df.reindex(columns=feat_names, fill_value=0).values
-                    else:
-                        X_svr = X_df.values
-                        feat_names = candidate_cols
+                    feat_names = list(getattr(first, "feature_names_in_", candidate_cols))
                 else:
-                    X_svr = X_df.values
                     feat_names = candidate_cols
+                X_svr = X_filled.reindex(columns=feat_names, fill_value=0).values
                 y_pred = np.array(svr_model.predict(X_svr), dtype=float)
                 model_used = "svr_combined"
                 svr_loaded = True
-            except Exception as svr_err:
-                model_used = f"ols_fallback (svr failed: {svr_err})"
-                svr_loaded = False
-
-        if svr_loaded:
-            # Permutation importances (separate try so predict success isn't lost)
-            try:
-                from sklearn.inspection import permutation_importance
-                pi = permutation_importance(
-                    svr_model, X_svr, y, n_repeats=5, random_state=42, scoring="r2"
-                )
-                imp_pairs = list(zip(feat_names, pi.importances_mean.tolist()))
-                imp_pairs.sort(key=lambda t: abs(t[1]), reverse=True)
-                importances = [{"feature": str(f), "coefficient": _safe_float(v)} for f, v in imp_pairs[:15]]
-            except Exception:
-                # Fallback: use absolute deviation from mean as proxy importance
+                # Feature importance via deviation proxy
                 deviations = np.abs(X_svr - X_svr.mean(axis=0)).mean(axis=0)
-                imp_pairs2 = list(zip(feat_names, deviations.tolist()))
-                imp_pairs2.sort(key=lambda t: t[1], reverse=True)
-                importances = [{"feature": str(f), "coefficient": _safe_float(v)} for f, v in imp_pairs2[:15]]
+                imp = sorted(zip(feat_names, deviations.tolist()), key=lambda t: t[1], reverse=True)
+                importances = [{"feature": f, "coefficient": _safe_float(v)} for f, v in imp[:15]]
+            except Exception as e:
+                model_used = f"ols_fallback (svr failed: {e})"
 
-        if not svr_loaded:
-            # ── OLS fallback ──────────────────────────────────────────────────
-            # Use only _mean columns for OLS to keep it tractable
-            mean_cols = [c for c in candidate_cols if c.endswith("_mean")]
-            if not mean_cols:
-                mean_cols = candidate_cols[:20]  # take first 20
-            X_ols = sub[mean_cols].fillna(sub[mean_cols].mean()).values
-            X_mean_v = X_ols.mean(axis=0)
-            X_std_v = X_ols.std(axis=0)
-            X_std_v[X_std_v == 0] = 1
-            Xn = (X_ols - X_mean_v) / X_std_v
-            Xb = np.column_stack([np.ones(len(Xn)), Xn])
+        # ── OLS fallback ─────────────────────────────────────────────────────
+        if not svr_loaded and has_y_mask.sum() >= 5:
+            mean_cols = [c for c in candidate_cols if c.endswith("_mean")] or candidate_cols[:20]
+            X_ols = X_filled[mean_cols].values
+            y_train = y_actual.astype(float)[has_y_mask]
+            X_train = X_ols[has_y_mask]
+            xm = X_train.mean(axis=0); xs = X_train.std(axis=0)
+            xs[xs == 0] = 1
+            Xtn = (X_train - xm) / xs
+            Xb = np.column_stack([np.ones(len(Xtn)), Xtn])
             try:
-                coeffs = np.linalg.lstsq(Xb, y, rcond=None)[0]
+                coeffs = np.linalg.lstsq(Xb, y_train, rcond=None)[0]
+                Xall = np.column_stack([np.ones(len(X_ols)), (X_ols - xm) / xs])
+                y_pred = Xall @ coeffs
+                model_used = "ols_fallback"
+                raw_c = coeffs[1:]
+                imp_ols = sorted(zip(mean_cols, raw_c.tolist()), key=lambda t: abs(t[1]), reverse=True)
+                importances = [{"feature": f[:-5] if f.endswith("_mean") else f, "coefficient": _safe_float(v)} for f, v in imp_ols[:15]]
             except Exception:
-                return {"predictions":[], "feature_importances":[], "r2":None,
-                        "model_used":"ols_fallback", "message":"Regression failed"}
-            y_pred = Xb @ coeffs
-            raw_coeffs = coeffs[1:]  # skip intercept
-            imp_pairs_ols = list(zip(mean_cols, raw_coeffs.tolist()))
-            imp_pairs_ols.sort(key=lambda t: abs(t[1]), reverse=True)
-            importances = [{"feature": f[:-5], "coefficient": _safe_float(v)} for f, v in imp_pairs_ols[:15]]
+                model_used = "ols_fallback_failed"
 
-        ss_res = float(np.sum((y - y_pred) ** 2))
-        ss_tot = float(np.sum((y - y.mean()) ** 2))
-        r2 = float(1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+        # ── R² (only meaningful if we have actual yield) ──────────────────────
+        if has_actual_yield and has_y_mask.sum() > 1:
+            y_act_valid = y_actual.astype(float)[has_y_mask]
+            y_pred_valid = y_pred[has_y_mask]
+            ss_res = float(np.sum((y_act_valid - y_pred_valid) ** 2))
+            ss_tot = float(np.sum((y_act_valid - y_act_valid.mean()) ** 2))
+            r2: float | None = float(1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+        else:
+            r2 = None
 
+        # ── Build yield class from gm (genotype-level) ───────────────────────
+        geno_class = dict(zip(gm["genotype"], gm["Yield_Class"])) if not gm.empty else {}
+
+        # ── Per-plot predictions ─────────────────────────────────────────────
         preds = []
-        for i, (idx, row) in enumerate(sub.iterrows()):
+        for i, (_, row) in enumerate(work.iterrows()):
+            act = _safe_float(float(row["Yield"])) if has_actual_yield else None
+            pred = _safe_float(float(y_pred[i])) if not np.isnan(y_pred[i]) else None
+            geno = row.get("genotype")
             preds.append({
-                "genotype": int(row["genotype"]),
-                "Yield_Class": str(row["Yield_Class"]),
-                "actual_yield": _safe_float(float(row["Yield"])),
-                "predicted_yield": _safe_float(float(y_pred[i])),
+                "plot_id": str(row.get("PLOT_ID", i)),
+                "genotype": _safe_float(geno),
+                "actual_yield": act,
+                "predicted_yield": pred,
+                "Yield_Class": geno_class.get(geno, "Unknown"),
             })
 
         return {
             "predictions": preds,
             "feature_importances": importances,
-            "r2": _safe_float(r2),
-            "n_genotypes": len(sub),
+            "feature_null_summary": feature_null_summary,
+            "r2": _safe_float(r2) if r2 is not None else None,
+            "n_plots": len(df),
+            "n_genotypes": int(df["genotype"].nunique()),
             "model_used": model_used,
+            "has_actual_yield": has_actual_yield,
         }
 
     def get_chat_context(self) -> dict:
