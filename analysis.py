@@ -421,7 +421,7 @@ class AnalysisEngine:
         Returns per-plot rows + feature null summary.
         """
         df = self._load_temporal()
-        has_actual_yield = df["Yield"].notna().any()
+        has_actual_yield = bool(df["Yield"].notna().any())
         _, gm, _, _ = self._prepare(df)
 
         # ── candidate feature columns ─────────────────────────────────────────
