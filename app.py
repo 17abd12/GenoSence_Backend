@@ -59,7 +59,7 @@ app = FastAPI(title="Agricultural Dashboard API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN, "http://127.0.0.1:3000"],
+    allow_origins=[FRONTEND_ORIGIN, "http://127.0.0.1:3000", "https://genosence-frontend.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
