@@ -42,6 +42,7 @@ MONGO_DB = os.getenv("MONGO_DB", "genosence")
 JWT_SECRET = os.getenv("JWT_SECRET")
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
+IS_PRODUCTION = os.getenv("ENVIRONMENT") == "production" or os.getenv("RAILWAY_ENVIRONMENT") is not None or "railway.app" in os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
 
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
@@ -264,8 +265,8 @@ def auth_signup(payload: SignUpRequest) -> JSONResponse:
         key="access_token",
         value=token,
         httponly=True,
-        samesite="lax",
-        secure=False,
+        samesite="none" if IS_PRODUCTION else "lax",
+        secure=IS_PRODUCTION,
         max_age=JWT_EXPIRE_MINUTES * 60,
     )
     return response
@@ -285,8 +286,8 @@ def auth_signin(payload: SignInRequest) -> JSONResponse:
         key="access_token",
         value=token,
         httponly=True,
-        samesite="lax",
-        secure=False,
+        samesite="none" if IS_PRODUCTION else "lax",
+        secure=IS_PRODUCTION,
         max_age=JWT_EXPIRE_MINUTES * 60,
     )
     return response
@@ -295,7 +296,11 @@ def auth_signin(payload: SignInRequest) -> JSONResponse:
 @app.post("/auth/signout")
 def auth_signout() -> JSONResponse:
     response = JSONResponse({"ok": True})
-    response.delete_cookie("access_token")
+    response.delete_cookie(
+        "access_token",
+        samesite="none" if IS_PRODUCTION else "lax",
+        secure=IS_PRODUCTION
+    )
     return response
 
 
