@@ -37,7 +37,7 @@ GPT_API_KEY = os.getenv("GPT_API_KEY")
 openai_client = OpenAI(api_key=GPT_API_KEY) if GPT_API_KEY else None
 SAMPLES_DIR = APP_ROOT / "samples"
 
-MONGO_URL = os.getenv("MongoURl")
+MONGO_URL = os.getenv("MONGO_URL") or os.getenv("MongoURl")
 MONGO_DB = os.getenv("MONGO_DB", "genosence")
 JWT_SECRET = os.getenv("JWT_SECRET")
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))
@@ -64,6 +64,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/")
+def root_health() -> JSONResponse:
+    return JSONResponse({"status": "ok", "service": "genosence-backend"})
 
 
 @app.on_event("startup")
