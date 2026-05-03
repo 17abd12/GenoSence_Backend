@@ -312,6 +312,16 @@ def auth_me(request: Request) -> JSONResponse:
     return JSONResponse({"user": to_public_user(user).model_dump()})
 
 
+@app.get("/user/last-upload/info")
+def get_user_last_upload_info(request: Request) -> JSONResponse:
+    user = get_current_user(request)
+    if not user:
+        return JSONResponse({"session_id": None})
+    temporal_doc = _get_last_temporal_doc(user)
+    if temporal_doc and "session_id" in temporal_doc:
+        return JSONResponse({"session_id": temporal_doc["session_id"]})
+    return JSONResponse({"session_id": None})
+
 # ─────────────────────────────────────────────────────────────────
 # File serving
 # ─────────────────────────────────────────────────────────────────
