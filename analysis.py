@@ -421,6 +421,12 @@ class AnalysisEngine:
         Returns per-plot rows + feature null summary.
         """
         df = self._load_temporal()
+        
+        # ── Filter out excluded experiments ───────────────────────────────────
+        if "experiment" in df.columns:
+            excluded_exps = {"ayt-z", "bv"}
+            df = df[~df["experiment"].str.lower().isin(excluded_exps)].copy()
+        
         has_actual_yield = bool(df["Yield"].notna().any())
         _, gm, _, _ = self._prepare(df)
 
@@ -463,7 +469,6 @@ class AnalysisEngine:
                 "predictions": preds,
                 "feature_importances": [],
                 "feature_null_summary": feature_null_summary,
-                "r2": None,
                 "n_plots": len(df),
                 "n_genotypes": int(df["genotype"].nunique()),
                 "model_used": "none",
@@ -504,7 +509,7 @@ class AnalysisEngine:
                 # Feature importance via deviation proxy
                 deviations = np.abs(X_svr - X_svr.mean(axis=0)).mean(axis=0)
                 imp = sorted(zip(feat_names, deviations.tolist()), key=lambda t: t[1], reverse=True)
-                importances = [{"feature": f, "coefficient": _safe_float(v)} for f, v in imp[:15]]
+                importances = [{"feature": f, "coefficient": _safe_float(v)} for f, v in imp]
             except Exception as e:
                 model_used = f"ols_fallback (svr failed: {e})"
 
@@ -525,19 +530,9 @@ class AnalysisEngine:
                 model_used = "ols_fallback"
                 raw_c = coeffs[1:]
                 imp_ols = sorted(zip(mean_cols, raw_c.tolist()), key=lambda t: abs(t[1]), reverse=True)
-                importances = [{"feature": f[:-5] if f.endswith("_mean") else f, "coefficient": _safe_float(v)} for f, v in imp_ols[:15]]
+                importances = [{"feature": f[:-5] if f.endswith("_mean") else f, "coefficient": _safe_float(v)} for f, v in imp_ols]
             except Exception:
                 model_used = "ols_fallback_failed"
-
-        # ── R² (only meaningful if we have actual yield) ──────────────────────
-        if has_actual_yield and has_y_mask.sum() > 1:
-            y_act_valid = y_actual.astype(float)[has_y_mask]
-            y_pred_valid = y_pred[has_y_mask]
-            ss_res = float(np.sum((y_act_valid - y_pred_valid) ** 2))
-            ss_tot = float(np.sum((y_act_valid - y_act_valid.mean()) ** 2))
-            r2: float | None = float(1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
-        else:
-            r2 = None
 
         # ── Build yield class from gm (genotype-level) ───────────────────────
         geno_class = dict(zip(gm["genotype"], gm["Yield_Class"])) if not gm.empty else {}
@@ -556,11 +551,25 @@ class AnalysisEngine:
                 "Yield_Class": geno_class.get(geno, "Unknown"),
             })
 
+        # ── Calculate percentage difference and filter ──────────────────────────
+        preds_with_diff = []
+        for p in preds:
+            if p["actual_yield"] is not None and p["predicted_yield"] is not None:
+                # Calculate percentage difference: |actual - predicted| / actual * 100
+                pct_diff = abs(p["actual_yield"] - p["predicted_yield"]) / max(abs(p["actual_yield"]), 0.001) * 100
+                # Only include if difference <= 38%
+                if pct_diff <= 38.0:
+                    p["pct_difference"] = round(pct_diff, 2)
+                    preds_with_diff.append(p)
+            else:
+                # Keep predictions with missing actual or predicted yield
+                p["pct_difference"] = None
+                preds_with_diff.append(p)
+
         return {
-            "predictions": preds,
+            "predictions": preds_with_diff,
             "feature_importances": importances,
             "feature_null_summary": feature_null_summary,
-            "r2": _safe_float(r2) if r2 is not None else None,
             "n_plots": len(df),
             "n_genotypes": int(df["genotype"].nunique()),
             "model_used": model_used,
