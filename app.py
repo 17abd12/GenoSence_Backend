@@ -50,6 +50,7 @@ JWT_SECRET = os.getenv("JWT_SECRET")
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
 IS_PRODUCTION = os.getenv("ENVIRONMENT") == "production" or os.getenv("RAILWAY_ENVIRONMENT") is not None or "railway.app" in os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
@@ -65,15 +66,16 @@ _sessions: dict[str, dict[str, Any]] = {}
 
 app = FastAPI(title="Agricultural Dashboard API")
 
-dev_origins = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "https://geno-sence-frontend.vercel.app",
-]
+# Build allowed origins list: start with FRONTEND_ORIGIN, add localhost variants, add Vercel
+allowed_origins = [FRONTEND_ORIGIN]
+if FRONTEND_ORIGIN != "http://localhost:3000":
+    allowed_origins.extend(["http://localhost:3000", "http://127.0.0.1:3000"])
+if "vercel.app" not in FRONTEND_ORIGIN:
+    allowed_origins.append("https://geno-sence-frontend.vercel.app")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN, "http://127.0.0.1:3000", "https://geno-sence-frontend.vercel.app"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
