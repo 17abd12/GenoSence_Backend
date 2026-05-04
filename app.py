@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import shutil
 import tempfile
@@ -9,11 +10,17 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+import traceback
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request as UrlRequest, urlopen
 
 import numpy as np
 import pandas as pd
 import jwt
 import boto3
+from google.auth.transport import requests
+from google.oauth2 import id_token
 from botocore.exceptions import ClientError
 from passlib.context import CryptContext
 from pymongo import MongoClient
@@ -42,6 +49,7 @@ MONGO_DB = os.getenv("MONGO_DB", "genosence")
 JWT_SECRET = os.getenv("JWT_SECRET")
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
@@ -57,9 +65,16 @@ _sessions: dict[str, dict[str, Any]] = {}
 
 app = FastAPI(title="Agricultural Dashboard API")
 
+dev_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://geno-sence-frontend.vercel.app",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN, "http://127.0.0.1:3000"],
+    allow_origins=list({FRONTEND_ORIGIN, *dev_origins}),
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -99,6 +114,10 @@ class SignUpRequest(BaseModel):
 class SignInRequest(BaseModel):
     email: str
     password: str
+
+
+class GoogleTokenRequest(BaseModel):
+    token: str
 
 
 class UserPublic(BaseModel):
@@ -159,6 +178,11 @@ def decode_access_token(token: str) -> dict[str, Any]:
 
 def get_current_user(request: Request) -> dict[str, Any] | None:
     token = request.cookies.get("access_token")
+    # Fallback: accept Authorization: Bearer <token> header for local-dev token flow
+    if not token:
+        auth_header = request.headers.get("Authorization") or request.headers.get("authorization")
+        if auth_header and isinstance(auth_header, str) and auth_header.lower().startswith("bearer "):
+            token = auth_header.split(" ", 1)[1].strip()
     if not token:
         return None
     try:
@@ -231,6 +255,89 @@ def compact_context(context: str | None, limit: int = 2000) -> str | None:
     return f"{context[:limit]}\n...(truncated)"
 
 
+def _verify_google_access_token(token: str, id_token_error: Exception | None = None) -> dict[str, Any]:
+    userinfo_url = "https://www.googleapis.com/oauth2/v3/userinfo"
+
+    try:
+        req = UrlRequest(
+            userinfo_url,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urlopen(req, timeout=10) as response:
+            user_info = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, ValueError) as access_token_error:
+        if id_token_error is not None:
+            raise HTTPException(
+                status_code=401,
+                detail=f"Invalid Google token: {id_token_error}; access token check failed: {access_token_error}",
+            ) from access_token_error
+        raise HTTPException(status_code=401, detail=f"Invalid Google access token: {access_token_error}") from access_token_error
+
+    email = str(user_info.get("email", "")).strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Google account email is missing")
+
+    name = str(user_info.get("name") or user_info.get("given_name") or "Google User").strip() or "Google User"
+    user_info.setdefault("email", email)
+    user_info.setdefault("name", name)
+    user_info.setdefault("sub", user_info.get("id") or email)
+    return user_info
+
+
+def _verify_google_token(token: str) -> dict[str, Any]:
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="Google OAuth is not configured")
+    if not token:
+        raise HTTPException(status_code=400, detail="Google token is required")
+
+    token = token.strip()
+
+    # Google access tokens from useGoogleLogin() are opaque strings (for example, ya29...).
+    # Only JWT-shaped tokens should go through ID-token verification.
+    if token.count(".") != 2:
+        return _verify_google_access_token(token)
+
+    try:
+        id_info = id_token.verify_oauth2_token(
+            token,
+            requests.Request(),
+            GOOGLE_CLIENT_ID,
+        )
+        if str(id_info.get("aud")) != GOOGLE_CLIENT_ID:
+            raise HTTPException(status_code=401, detail="Google token audience does not match this app")
+
+        email = str(id_info.get("email", "")).strip().lower()
+        if not email:
+            raise HTTPException(status_code=400, detail="Google account email is missing")
+
+        return id_info
+    except Exception as id_token_error:
+        access_token = token.strip()
+        userinfo_url = "https://www.googleapis.com/oauth2/v3/userinfo"
+        try:
+            req = UrlRequest(
+                userinfo_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            with urlopen(req, timeout=10) as response:
+                user_info = json.loads(response.read().decode("utf-8"))
+        except (HTTPError, URLError, TimeoutError, ValueError) as access_token_error:
+            raise HTTPException(
+                status_code=401,
+                detail=f"Invalid Google token: {id_token_error}; access token check failed: {access_token_error}",
+            ) from access_token_error
+
+        email = str(user_info.get("email", "")).strip().lower()
+        if not email:
+            raise HTTPException(status_code=400, detail="Google account email is missing")
+
+        name = str(user_info.get("name") or user_info.get("given_name") or "Google User").strip() or "Google User"
+        user_info.setdefault("email", email)
+        user_info.setdefault("name", name)
+        user_info.setdefault("sub", user_info.get("id") or email)
+        return user_info
+
+
 # ─────────────────────────────────────────────────────────────────
 # Auth endpoints
 # ─────────────────────────────────────────────────────────────────
@@ -259,7 +366,7 @@ def auth_signup(payload: SignUpRequest) -> JSONResponse:
     ensure_user_r2_prefix(user_id)
     token = create_access_token(user_id, email)
     user = users.find_one({"_id": ObjectId(user_id)})
-    response = JSONResponse({"user": to_public_user(user).model_dump()})
+    response = JSONResponse({"user": to_public_user(user).model_dump(), "access_token": token})
     response.set_cookie(
         key="access_token",
         value=token,
@@ -280,7 +387,7 @@ def auth_signin(payload: SignInRequest) -> JSONResponse:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     token = create_access_token(str(user["_id"]), email)
-    response = JSONResponse({"user": to_public_user(user).model_dump()})
+    response = JSONResponse({"user": to_public_user(user).model_dump(), "access_token": token})
     response.set_cookie(
         key="access_token",
         value=token,
@@ -305,6 +412,86 @@ def auth_me(request: Request) -> JSONResponse:
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return JSONResponse({"user": to_public_user(user).model_dump()})
+
+
+@app.post("/auth/google-signup")
+def auth_google_signup(payload: GoogleTokenRequest) -> JSONResponse:
+    """Authenticate and create/get user from Google OAuth token."""
+    try:
+        token = getattr(payload, "token", "")
+        id_info = _verify_google_token(token)
+        email = str(id_info.get("email", "")).strip().lower()
+        name = str(id_info.get("name") or "Google User").strip() or "Google User"
+
+        users = get_users_collection()
+        user = users.find_one({"email": email})
+
+        if not user:
+            user_doc = {
+                "name": name,
+                "email": email,
+                "password_hash": None,
+                "google_id": id_info.get("sub"),
+                "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                "last_processed_files": None,
+            }
+            result = users.insert_one(user_doc)
+            user_id = str(result.inserted_id)
+            ensure_user_r2_prefix(user_id)
+            user = users.find_one({"_id": ObjectId(user_id)})
+        else:
+            if not user.get("google_id"):
+                users.update_one(
+                    {"_id": user["_id"]},
+                    {"$set": {"google_id": id_info.get("sub")}},
+                )
+
+        token = create_access_token(str(user["_id"]), email)
+        response = JSONResponse({"user": to_public_user(user).model_dump(), "access_token": token})
+        response.set_cookie(
+            key="access_token",
+            value=token,
+            httponly=True,
+            samesite="lax",
+            secure=False,
+            max_age=JWT_EXPIRE_MINUTES * 60,
+        )
+        return response
+    except Exception as e:
+        print("Google signup failure:", repr(e))
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Authentication error: {str(e)}")
+
+
+@app.post("/auth/google-signin")
+def auth_google_signin(payload: GoogleTokenRequest) -> JSONResponse:
+    """Authenticate user with Google OAuth token."""
+    try:
+        token = getattr(payload, "token", "")
+        id_info = _verify_google_token(token)
+        email = str(id_info.get("email", "")).strip().lower()
+
+        users = get_users_collection()
+        user = users.find_one({"email": email})
+
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found. Please sign up first.")
+
+        token = create_access_token(str(user["_id"]), email)
+        response = JSONResponse({"user": to_public_user(user).model_dump(), "access_token": token})
+        response.set_cookie(
+            key="access_token",
+            value=token,
+            httponly=True,
+            samesite="lax",
+            secure=False,
+            max_age=JWT_EXPIRE_MINUTES * 60,
+        )
+        return response
+    except Exception as e:
+        print("Google signin failure:", repr(e))
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Authentication error: {str(e)}")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -447,29 +634,10 @@ def store_timestamps(user_id: str, session_id: str, timestamps_dir: Path) -> lis
     doc = {
         "user_id": user_id,
         "session_id": session_id,
-        "timestamps": timestamps,
         "created_at": datetime.now(tz=timezone.utc).isoformat(),
     }
     result = collection.insert_one(doc)
     return [str(result.inserted_id)]
-
-
-def store_shapefile_geojson(
-    user_id: str,
-    session_id: str,
-    geojson_data: dict[str, Any],
-    filename: str | None,
-) -> str:
-    collection = get_shapefiles_collection()
-    doc = {
-        "user_id": user_id,
-        "session_id": session_id,
-        "filename": filename,
-        "geojson": geojson_data,
-        "created_at": datetime.now(tz=timezone.utc).isoformat(),
-    }
-    result = collection.insert_one(doc)
-    return str(result.inserted_id)
 
 
 def update_user_last_processed_files(
