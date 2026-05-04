@@ -561,24 +561,297 @@ def process_reflectance_pair(rgb_path: Path, nir_path: Path, band_mapping: dict,
     For now we produce a stub STATS CSV that the analysis engine can consume.
     Returns path to the STATS CSV.
     """
-    # Derive genotypes from shapefile properties
+    # Read rasters and compute per-plot VI stats from pixel values.
+    try:
+        import rasterio
+        from rasterio.mask import mask as rio_mask
+        from rasterio.warp import transform_bounds
+        from shapely.geometry import shape as geom_shape
+        from shapely.ops import transform as transform_geom
+        import pyproj
+    except Exception:
+        # If rasterio/shapely isn't installed, fall back to stub behavior (NaN stats)
+        rows = []
+        for feat in shapefile_geojson.get("features", []):
+            props = feat.get("properties", {})
+            plot_id = str(props.get("PLOT_ID", props.get("plot_id", "")))
+            parts = plot_id.split("_")
+            genotype = parts[-1] if parts else "0"
+            row = {"PLOT_ID": plot_id, "genotype": genotype}
+            for vi in VI_COLS:
+                for stat in STAT_AGG:
+                    row[f"{vi}_{stat}"] = np.nan
+            rows.append(row)
+        df = pd.DataFrame(rows)
+        out_path = out_dir / f"{timestamp_label}_STATS.csv"
+        df.to_csv(out_path, index=False)
+        return out_path
+
+    # Helper for safe statistic calculation
+    def _safe_stats(arr: np.ndarray) -> dict:
+        a = arr.astype(float)
+        a = a[~np.isnan(a)]
+        if a.size == 0:
+            return {s: np.nan for s in STAT_AGG}
+        return {
+            "sum": float(np.nansum(a)),
+            "count": int(a.size),
+            "mean": float(np.nanmean(a)),
+            "median": float(np.nanmedian(a)),
+            "std": float(np.nanstd(a, ddof=0)),
+            "var": float(np.nanvar(a, ddof=0)),
+            "min": float(np.nanmin(a)),
+            "max": float(np.nanmax(a)),
+        }
+
+    # Open rasters
+    src_rgb = rasterio.open(rgb_path)
+    src_nir = rasterio.open(nir_path)
+    print(f"Opened rasters for {timestamp_label}:")
+    print(f"  RGB: shape={src_rgb.shape}, count={src_rgb.count} bands, crs={src_rgb.crs}, dtype={src_rgb.dtypes}")
+    print(f"  NIR: shape={src_nir.shape}, count={src_nir.count} bands, crs={src_nir.crs}, dtype={src_nir.dtypes}")
+    print(f"Band mapping: {band_mapping}")
+
+    # Get raster CRS for geometry reprojection
+    raster_crs = src_rgb.crs
+    if not raster_crs:
+        print(f"WARNING: Raster has no CRS; assuming EPSG:4326")
+        raster_crs = pyproj.CRS("EPSG:4326")
+    else:
+        raster_crs = pyproj.CRS.from_string(str(raster_crs))
+
+    # Build transformer for GeoJSON (assumed EPSG:4326) -> raster CRS
+    try:
+        geojson_crs = pyproj.CRS("EPSG:4326")
+        if geojson_crs != raster_crs:
+            transformer = pyproj.Transformer.from_crs(geojson_crs, raster_crs, always_xy=True)
+            print(f"Will reproject geometries from EPSG:4326 to {raster_crs}")
+        else:
+            transformer = None
+            print(f"GeoJSON and raster CRS both {raster_crs}; no reprojection needed")
+    except Exception as e:
+        print(f"Failed to build transformer: {e}; no reprojection")
+        transformer = None
+
+    def reproject_geom(geom_dict, transformer):
+        """Reproject GeoJSON geometry dict to raster CRS."""
+        if not transformer:
+            return geom_dict
+        try:
+            geom_shape_obj = geom_shape(geom_dict)
+            reprojected = transform_geom(transformer.transform, geom_shape_obj)
+            return reprojected.__geo_interface__
+        except Exception as e:
+            print(f"Reprojection failed: {e}")
+            return geom_dict
+
     rows = []
     for feat in shapefile_geojson.get("features", []):
         props = feat.get("properties", {})
         plot_id = str(props.get("PLOT_ID", props.get("plot_id", "")))
-        # Genotype is last segment of PLOT_ID separated by "_"
         parts = plot_id.split("_")
         genotype = parts[-1] if parts else "0"
-        rows.append({"PLOT_ID": plot_id, "genotype": genotype})
+        geom = feat.get("geometry")
+        if geom is None:
+            print(f"{plot_id}: no geometry!")
+            continue
+
+        # Reproject geometry if needed
+        geom = reproject_geom(geom, transformer)
+        print(f"Processing {plot_id} with geometry type {geom.get('type')}")
+
+        row = {"PLOT_ID": plot_id, "genotype": genotype}
+
+        try:
+            # rio_mask expects geometry as GeoJSON-like dict or shapely geometry
+            # Convert dict to shapely if needed
+            if isinstance(geom, dict):
+                geom_for_mask = [geom_shape(geom)]
+            else:
+                geom_for_mask = [geom]
+            
+            rgb_masked, rgb_transform = rio_mask(src_rgb, geom_for_mask, crop=True, nodata=np.nan)
+            print(f"  {plot_id}: RGB masked shape={rgb_masked.shape}, dtype={rgb_masked.dtype}, has NaN: {np.isnan(rgb_masked).all()}")
+        except Exception as e:
+            print(f"  {plot_id}: RGB masking failed: {type(e).__name__}: {e}")
+            rgb_masked = None
+
+        try:
+            if isinstance(geom, dict):
+                geom_for_mask = [geom_shape(geom)]
+            else:
+                geom_for_mask = [geom]
+            
+            nir_masked, nir_transform = rio_mask(src_nir, geom_for_mask, crop=True, nodata=np.nan)
+            print(f"  {plot_id}: NIR masked shape={nir_masked.shape}, dtype={nir_masked.dtype}, has NaN: {np.isnan(nir_masked).all()}")
+        except Exception as e:
+            print(f"  {plot_id}: NIR masking failed: {type(e).__name__}: {e}")
+            nir_masked = None
+
+        # Build a dict of available bands per pixel
+        bands: dict[str, np.ndarray] = {}
+        # band_mapping values are 1-based indices; ensure within range
+        try:
+            if rgb_masked is not None:
+                # rgb_masked shape = (bands, H, W)
+                br = band_mapping.get("band_red", 1)
+                bg = band_mapping.get("band_green", 2)
+                bb = band_mapping.get("band_blue", 3)
+                # Ensure indices within available bands
+                for name, idx in [("Red", br), ("Green", bg), ("Blue", bb)]:
+                    if 1 <= idx <= rgb_masked.shape[0]:
+                        bands[name] = rgb_masked[idx - 1].astype(float)
+                print(f"  {plot_id}: extracted RGB bands: {list(bands.keys())}")
+        except Exception as e:
+            print(f"  {plot_id}: RGB band extraction failed: {e}")
+
+        try:
+            if nir_masked is not None:
+                bn = band_mapping.get("band_nir", 1)
+                if 1 <= bn <= nir_masked.shape[0]:
+                    bands["NIR"] = nir_masked[bn - 1].astype(float)
+                    print(f"  {plot_id}: extracted NIR band, bands now: {list(bands.keys())}")
+        except Exception as e:
+            print(f"  {plot_id}: NIR band extraction failed: {e}")
+
+        # Try to get Rededge from either NIR file or RGB if provided
+        try:
+            bre = band_mapping.get("band_rededge")
+            if bre is not None:
+                # check NIR first
+                if nir_masked is not None and 1 <= bre <= nir_masked.shape[0]:
+                    bands["Rededge"] = nir_masked[bre - 1].astype(float)
+                    print(f"  {plot_id}: extracted Rededge from NIR")
+                elif rgb_masked is not None and 1 <= bre <= rgb_masked.shape[0]:
+                    bands["Rededge"] = rgb_masked[bre - 1].astype(float)
+                    print(f"  {plot_id}: extracted Rededge from RGB")
+        except Exception as e:
+            print(f"  {plot_id}: Rededge extraction failed: {e}")
+
+        print(f"  {plot_id}: final bands dict: {list(bands.keys())}")
+
+        # Compute VIs; where input bands missing, result will be NaN
+        vi_arrays: dict[str, np.ndarray] = {}
+        # Create a mask of valid pixels where any band is finite
+        valid_mask = None
+        for b in bands.values():
+            finite = np.isfinite(b)
+            valid_mask = finite if valid_mask is None else (valid_mask & finite)
+
+        # If no full-band valid_mask, allow per-formula masked calculations (use nan-safe ops)
+        for vi_name, fn in VI_FORMULAS.items():
+            try:
+                # Prepare a small dict of arrays for lambda evaluation
+                env = {}
+                for key in ("NIR", "Rededge", "Red", "Blue", "Green"):
+                    env[key] = bands.get(key, np.full_like(next(iter(bands.values())), np.nan)) if bands else np.array([np.nan])
+                arr = fn(env)
+                # Ensure array shape flattened to 1D for stats
+                if isinstance(arr, np.ndarray):
+                    vi_arrays[vi_name] = arr
+                else:
+                    vi_arrays[vi_name] = np.array(arr)
+                # Check if any finite values
+                if isinstance(arr, np.ndarray):
+                    finite_count = np.isfinite(arr).sum()
+                    print(f"  {plot_id}: {vi_name} has {finite_count} finite values out of {arr.size}")
+            except Exception as e:
+                print(f"  {plot_id}: VI formula {vi_name} failed: {e}")
+                vi_arrays[vi_name] = np.array([np.nan])
+
+        # Calculate stats for each VI and add to row
+        for vi, arr in vi_arrays.items():
+            # Flatten and drop NaNs
+            if arr is None:
+                stats = {s: np.nan for s in STAT_AGG}
+            else:
+                flat = arr.flatten()
+                stats = _safe_stats(flat)
+            for s, val in stats.items():
+                row[f"{vi}_{s}"] = val
+
+        rows.append(row)
+
+    # Close datasets
+    try:
+        src_rgb.close()
+    except Exception:
+        pass
+    try:
+        src_nir.close()
+    except Exception:
+        pass
 
     df = pd.DataFrame(rows)
-    for vi in VI_COLS:
-        for stat in STAT_AGG:
-            df[f"{vi}_{stat}"] = np.nan
-
+    if not df.empty:
+        print(f"/upload/reflectance-maps: extracted values for {timestamp_label}")
+        print(df.to_string(index=False))
+    else:
+        print(f"/upload/reflectance-maps: no plot rows extracted for {timestamp_label}")
     out_path = out_dir / f"{timestamp_label}_STATS.csv"
     df.to_csv(out_path, index=False)
     return out_path
+
+
+def build_temporal_summary_from_stats(
+    stats_paths: list[Path],
+    geojson_data: dict[str, Any],
+) -> pd.DataFrame:
+    """Aggregate per-timestamp STATS CSVs into one per-plot temporal table."""
+    base_rows: list[dict[str, Any]] = []
+    for feat in geojson_data.get("features", []):
+        props = feat.get("properties", {})
+        plot_id = str(props.get("PLOT_ID", props.get("plot_id", "")))
+        if not plot_id:
+            continue
+        parts = plot_id.split("_")
+        genotype = parts[-1] if parts else "0"
+        base_rows.append({
+            "PLOT_ID": plot_id,
+            "genotype": genotype,
+            "Yield": props.get("Yield", np.nan),
+        })
+
+    base_df = pd.DataFrame(base_rows).drop_duplicates("PLOT_ID")
+    if base_df.empty:
+        return base_df
+
+    long_frames: list[pd.DataFrame] = []
+    for ts_idx, stats_path in enumerate(stats_paths, start=1):
+        try:
+            ts_df = pd.read_csv(stats_path)
+        except Exception:
+            continue
+        ts_df.columns = ts_df.columns.str.strip()
+        if "PLOT_ID" not in ts_df.columns:
+            continue
+        ts_df = ts_df.copy()
+        ts_df["timestamp_idx"] = ts_idx
+        long_frames.append(ts_df)
+
+    if not long_frames:
+        return base_df
+
+    long_df = pd.concat(long_frames, ignore_index=True, sort=False)
+    long_df["PLOT_ID"] = long_df["PLOT_ID"].astype(str)
+
+    summary = base_df.copy()
+    for vi in VI_COLS:
+        mean_col = f"{vi}_mean"
+        if mean_col not in long_df.columns:
+            continue
+        working = long_df[["PLOT_ID", mean_col]].copy()
+        working[mean_col] = pd.to_numeric(working[mean_col], errors="coerce")
+        agg = working.groupby("PLOT_ID")[mean_col].agg(["mean", "std", "max", "min"]).reset_index()
+        agg = agg.rename(columns={
+            "mean": f"{vi}_mean",
+            "std": f"{vi}_std",
+            "max": f"{vi}_max",
+            "min": f"{vi}_min",
+        })
+        summary = summary.merge(agg, on="PLOT_ID", how="left")
+
+    return summary
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -656,38 +929,27 @@ async def upload_reflectance_maps(
         rgb_path.write_bytes(content_rgb)
         nir_path.write_bytes(content_nir)
 
+        # Keep source tif files local only. We upload only extracted CSV values.
         if user_id:
-            try:
-                rgb_key = upload_bytes_to_r2(user_id, content_rgb, rgb_file.filename)
-                nir_key = upload_bytes_to_r2(user_id, content_nir, nir_file.filename)
-                if rgb_key:
-                    reflectance_keys.append(rgb_key)
-                    print(f"/upload/reflectance-maps: uploaded RGB {rgb_file.filename} -> {rgb_key}")
-                if nir_key:
-                    reflectance_keys.append(nir_key)
-                    print(f"/upload/reflectance-maps: uploaded NIR {nir_file.filename} -> {nir_key}")
-            except Exception as exc:
-                print(f"/upload/reflectance-maps: failed to upload reflectance maps: {exc}")
+            print(
+                f"/upload/reflectance-maps: keeping source rasters local for {label}; "
+                f"not uploading {rgb_file.filename} / {nir_file.filename} to cloud storage"
+            )
 
         stats_df = process_reflectance_pair(
             rgb_path, nir_path, band_info, geojson_data, label, ts_dir
         )
         stats_files.append(stats_df.name if isinstance(stats_df, Path) else str(stats_df))
 
-    # Build a temporal CSV from genotype info in GeoJSON
-    rows = []
-    for feat in geojson_data.get("features", []):
-        props = feat.get("properties", {})
-        plot_id = str(props.get("PLOT_ID", props.get("plot_id", "")))
-        parts = plot_id.split("_")
-        genotype = parts[-1] if parts else "0"
-        rows.append({
-            "PLOT_ID": plot_id,
-            "genotype": genotype,
-            "Yield": props.get("Yield", np.nan),
-        })
+        try:
+            extracted_df = pd.read_csv(ts_dir / stats_files[-1])
+            print(f"/upload/reflectance-maps: timestamp {label} extracted CSV rows")
+            print(extracted_df.to_string(index=False))
+        except Exception as exc:
+            print(f"/upload/reflectance-maps: failed to read extracted stats for {label}: {exc}")
 
-    temporal_df = pd.DataFrame(rows)
+    # Build a temporal CSV from per-timestamp VI statistics.
+    temporal_df = build_temporal_summary_from_stats([ts_dir / name for name in stats_files], geojson_data)
     temporal_path = tmp_dir / "temporalDataSet.csv"
     temporal_df.to_csv(temporal_path, index=False)
 
@@ -1249,6 +1511,21 @@ def _resolve_engine(session_id: str | None) -> analysis.AnalysisEngine:
                 temporal_df = pd.DataFrame(records) if records else pd.DataFrame()
                 temporal_path = tmp_dir / "temporalDataSet.csv"
                 temporal_df.to_csv(temporal_path, index=False)
+                ts_labels: list[str] = []
+                ts_doc = get_timestamps_collection().find_one({
+                    "session_id": session_id,
+                    "user_id": temporal_doc.get("user_id"),
+                })
+                if ts_doc:
+                    import re as _re
+                    for idx, ts in enumerate(ts_doc.get("timestamps", []), start=1):
+                        label = str(ts.get("date") or f"t{idx}")
+                        safe_label = _re.sub(r"[^0-9A-Za-z_\-]", "_", label)
+                        ts_labels.append(safe_label)
+                        ts_records = ts.get("records", [])
+                        if ts_records:
+                            ts_df = pd.DataFrame(ts_records)
+                            ts_df.to_csv(ts_dir / f"final_{safe_label}.csv", index=False)
                 geojson_path: Path | None = None
                 if shapefile_doc:
                     geojson_path = tmp_dir / "plots.geojson"
@@ -1258,8 +1535,8 @@ def _resolve_engine(session_id: str | None) -> analysis.AnalysisEngine:
                     "timestamps_dir": ts_dir,
                     "geojson": geojson_path,
                     "mode": "restored",
-                    "timestamp_count": 0,
-                    "timestamp_labels": [],
+                    "timestamp_count": len(ts_labels),
+                    "timestamp_labels": ts_labels,
                 }
                 analysis.invalidate_session_cache(session_id)
                 print(f"_resolve_engine: restored session {session_id} from MongoDB")
