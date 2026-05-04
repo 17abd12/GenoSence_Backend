@@ -399,6 +399,77 @@ def auth_signin(payload: SignInRequest) -> JSONResponse:
     return response
 
 
+@app.post("/auth/google-signup")
+def auth_google_signup(payload: GoogleTokenRequest) -> JSONResponse:
+    user_info = _verify_google_token(payload.token)
+    email = str(user_info.get("email", "")).strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Google account email is missing")
+
+    users = get_users_collection()
+    try:
+        existing = users.find_one({"email": email})
+    except Exception:
+        existing = None
+
+    if existing:
+        raise HTTPException(status_code=409, detail="Email already registered")
+
+    user_doc = {
+        "name": str(user_info.get("name", "")).strip(),
+        "email": email,
+        "password_hash": "",
+        "created_at": datetime.now(tz=timezone.utc).isoformat(),
+        "last_processed_files": None,
+        "google_sub": user_info.get("sub"),
+    }
+
+    try:
+        result = users.insert_one(user_doc)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="Email already registered")
+
+    user_id = str(result.inserted_id)
+    ensure_user_r2_prefix(user_id)
+    token = create_access_token(user_id, email)
+    user = users.find_one({"_id": ObjectId(user_id)})
+    response = JSONResponse({"user": to_public_user(user).model_dump(), "access_token": token})
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        httponly=True,
+        samesite="none" if IS_PRODUCTION else "lax",
+        secure=IS_PRODUCTION,
+        max_age=JWT_EXPIRE_MINUTES * 60,
+    )
+    return response
+
+
+@app.post("/auth/google-signin")
+def auth_google_signin(payload: GoogleTokenRequest) -> JSONResponse:
+    user_info = _verify_google_token(payload.token)
+    email = str(user_info.get("email", "")).strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Google account email is missing")
+
+    users = get_users_collection()
+    user = users.find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    token = create_access_token(str(user["_id"]), email)
+    response = JSONResponse({"user": to_public_user(user).model_dump(), "access_token": token})
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        httponly=True,
+        samesite="none" if IS_PRODUCTION else "lax",
+        secure=IS_PRODUCTION,
+        max_age=JWT_EXPIRE_MINUTES * 60,
+    )
+    return response
+
+
 @app.post("/auth/signout")
 def auth_signout() -> JSONResponse:
     response = JSONResponse({"ok": True})
