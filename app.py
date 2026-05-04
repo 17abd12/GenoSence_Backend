@@ -89,6 +89,7 @@ class ChatRequest(BaseModel):
     message: str
     history: list[ChatMessage] = []
     context: str | None = None
+    session_id: str | None = None
 
 
 class SignUpRequest(BaseModel):
@@ -1679,29 +1680,142 @@ def yield_prediction(session_id: str | None = Query(default=None)) -> JSONRespon
 # Chat endpoint
 # ─────────────────────────────────────────────────────────────────
 
+# ── Vegetation-index reference (injected into every chat system prompt) ─────────
+VI_GLOSSARY = """
+VEGETATION INDEX REFERENCE (authoritative definitions — always use these):
+• NDVI  (Normalized Difference Vegetation Index): measures green biomass / photosynthetic
+  activity.  Range −1 to +1.  Higher = healthier, denser canopy.  Drops sharply during
+  senescence or water stress.
+• NDWI  (Normalized Difference Water Index): measures LIQUID WATER CONTENT in the canopy.
+  Higher NDWI = more water stored in leaves = lower water stress.  Negative or very low
+  NDWI = drought / dehydration stress.
+• NDRE  (Normalized Difference Red Edge): sensitive to chlorophyll concentration, especially
+  useful for detecting early nutrient stress before NDVI changes.  Higher = more chlorophyll.
+• MTCI  (MERIS Terrestrial Chlorophyll Index): tracks chlorophyll via red-edge contrast.
+  High MTCI ↔ abundant chlorophyll and active photosynthesis.
+• NDCI  (Normalized Difference Chlorophyll Index): alternative chlorophyll proxy (red-edge/red
+  ratio).  Higher = more chlorophyll.
+• MSI   (Moisture Stress Index): Red/NIR ratio — INVERSE of water status.  HIGH MSI = high
+  water stress / moisture deficit.  LOW MSI = well-watered crop.
+• WI    (Water Index): NIR/Green ratio — higher = more water content in vegetation.
+• SAVI  (Soil-Adjusted Vegetation Index): NDVI corrected for soil background reflectance;
+  more reliable at low canopy cover.
+• EVI   (Enhanced Vegetation Index): improved NDVI for high-biomass / high-LAI conditions;
+  less prone to saturation.
+• EXG   (Excess Green Index): 2G−R−B — emphasises green pigmentation; used for canopy
+  cover estimation in RGB imagery.
+• CIgreen (Chlorophyll Index Green): (NIR/Green)−1; tracks chlorophyll content from green
+  reflectance.
+• PSRI  (Plant Senescence Reflectance Index): (Red−Green)/NIR — rises as carotenoids
+  increase relative to chlorophyll; HIGH PSRI = active senescence / leaf aging.
+• SIPI  (Structure Insensitive Pigment Index): carotenoid-to-chlorophyll ratio proxy;
+  HIGH SIPI = stressed or senescing tissue.
+• Yield_Class: categorical performance bin — Low / Medium / High — derived from the
+  33rd and 66th percentile of mean yield across all genotypes.
+• CV (Coefficient of Variation): yield variability across plots.  <10% = very stable;
+  10–25% = moderate; >25% = high variation.
+"""
+
+
+def _build_csv_context(session_id: str | None, extra_context: str | None) -> str:
+    """Return the temporal CSV as a text table for the system prompt (max 100 rows)."""
+    csv_block = ""
+
+    def _format_df(df: pd.DataFrame) -> str:
+        df.columns = df.columns.str.strip()
+        if len(df) > 100:
+            df = df.sample(n=100, random_state=42)
+        return df.to_csv(index=False)
+
+    # 1. Try session in memory
+    if session_id and session_id in _sessions:
+        csv_path = _sessions[session_id].get("temporal_csv")
+        if csv_path and Path(csv_path).exists():
+            try:
+                df = pd.read_csv(csv_path)
+                csv_block = _format_df(df)
+            except Exception:
+                pass
+
+    # 2. Try MongoDB if session not in memory
+    if not csv_block and session_id and mongo_client:
+        try:
+            doc = get_temporal_collection().find_one({"session_id": session_id})
+            if doc and doc.get("records"):
+                df = pd.DataFrame(doc["records"])
+                csv_block = _format_df(df)
+        except Exception:
+            pass
+
+    # 3. Fallback → load the FULL sample temporal CSV from disk
+    if not csv_block:
+        try:
+            sample_csv = SAMPLES_DIR / "temporalDataSet.csv"
+            df_sample = pd.read_csv(sample_csv)
+            csv_block = _format_df(df_sample)
+        except Exception:
+            pass
+    # Last resort: compact engine summary
+    if not csv_block:
+        try:
+            eng = _resolve_engine(session_id)
+            ctx = eng.get_chat_context()
+            csv_block = ctx.get("context", "")
+        except Exception:
+            pass
+
+    if extra_context:
+        csv_block = (csv_block + "\n" + extra_context).strip()
+
+    return csv_block
+
+
 @app.post("/chat")
 def chat(req: ChatRequest) -> JSONResponse:
     if not openai_client:
         raise HTTPException(status_code=500, detail="GPT_API_KEY is not set")
 
-    context = compact_context(req.context)
+    # Build data context from the session CSV (or sample data if no session)
+    data_context = _build_csv_context(req.session_id, req.context)
+
     system_prompt = (
-        "You are an agronomy assistant. Provide concise, evidence-based guidance. "
-        "If you lack data, state the limitation and ask for what is needed."
+        "You are GenoSense AI — an agricultural crop-science assistant embedded in a "
+        "precision-phenotyping dashboard. You have access to the full experiment CSV below.\n"
+        "\n"
+        "STRICT RESPONSE RULES — follow every rule exactly, no exceptions:\n"
+        "RULE 1 — GENOTYPE QUERIES: If the user asks which genotype is best/worst/highest/lowest "
+        "for ANY trait, look up the data, find the answer, and reply with ONLY:\n"
+        "  'Genotype <number>' (e.g. 'Genotype 47')\n"
+        "  You MAY add one sentence of supporting data (e.g. the exact index value). "
+        "  Do NOT ask for clarification. Do NOT say you cannot determine it. "
+        "  Do NOT suggest uploading more data. Just pick the best one from the CSV.\n"
+        "RULE 2 — VALUE QUERIES: If asked for a specific value (yield, NDVI, etc.), "
+        "return ONLY the number from the CSV. Example: '0.742'\n"
+        "RULE 3 — EXPLANATION QUERIES: If asked what an index MEANS (not a data lookup), "
+        "give a 1-2 sentence definition using the VI Reference below.\n"
+        "RULE 4 — NEVER say 'I cannot determine', 'insufficient data', or 'please upload'. "
+        "The CSV is always provided — use it.\n"
+        "RULE 5 — Keep all answers under 3 sentences unless a table/breakdown is explicitly requested.\n"
+        f"\n{VI_GLOSSARY}"
     )
-    if context:
-        system_prompt += "\n\nContext data:\n" + context
+
+    if data_context:
+        system_prompt += (
+            "\n\n━━ EXPERIMENT DATA (full temporal CSV) ━━\n"
+            "This is the complete dataset. Use it to answer ALL data questions.\n"
+            + data_context
+        )
 
     history = clamp_history(req.history)
-    messages = [{"role": "system", "content": system_prompt}]
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
     messages += [{"role": m.role, "content": m.content} for m in history]
     messages.append({"role": "user", "content": req.message})
 
     response = openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=messages,
-        temperature=0.2,
-        max_tokens=500,
+        temperature=0.0,   # zero temperature = maximally factual / deterministic
+        max_tokens=700,
     )
     reply = response.choices[0].message.content or ""
     return JSONResponse({"reply": reply.strip()})

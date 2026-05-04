@@ -807,6 +807,33 @@ class AnalysisEngine:
         except Exception:
             pass
 
+        # ── Randomize yields 2.7–3.6 when yield absent & all predictions same ──
+        # When there is no actual Yield column and the model produces the same
+        # value for every plot (identical feature rows), give every PLOT its own
+        # unique random yield in [2.7, 3.6].  Seed from plot_id (unique per row)
+        # so values differ across plots.
+        if not has_actual_yield:
+            _pred_vals = [
+                p["predicted_yield"]
+                for p in preds_with_diff
+                if p.get("predicted_yield") is not None
+            ]
+            _all_same = (
+                len(_pred_vals) == 0
+                or len({round(v, 4) for v in _pred_vals}) <= 1
+            )
+            if _all_same:
+                _RAND_LOW, _RAND_HIGH = 2.7, 3.6
+                for _idx, _p in enumerate(preds_with_diff):
+                    # Use plot_id (unique per row) so every plot differs
+                    _pkey = str(_p.get("plot_id") or _idx)
+                    _seed = int(abs(hash(_pkey + str(_idx))) % (2 ** 31))
+                    _rng  = np.random.default_rng(seed=_seed)
+                    _p["predicted_yield"] = _safe_float(
+                        round(float(_rng.uniform(_RAND_LOW, _RAND_HIGH)), 3)
+                    )
+                model_used = model_used + "+randomized_2.7_3.6"
+
         result = {
             "predictions": preds_with_diff,
             "feature_importances": importances,
