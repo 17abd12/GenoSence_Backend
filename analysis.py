@@ -78,10 +78,19 @@ def _clean_nan_recursive(obj: Any) -> Any:
         if np.isnan(obj) or np.isinf(obj):
             return None
         return obj
-    elif isinstance(obj, (np.floating, np.integer)):
+    elif isinstance(obj, np.floating):
         if np.isnan(obj) or np.isinf(obj):
             return None
-        return obj.item() if hasattr(obj, 'item') else obj
+        return obj.item()
+    elif isinstance(obj, np.integer):
+        return obj.item()
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif hasattr(obj, 'item') and not isinstance(obj, str):
+        try:
+            return obj.item()
+        except Exception:
+            return obj
     else:
         return obj
 
@@ -654,6 +663,8 @@ class AnalysisEngine:
                     if cols:
                         ts_means[f"{base}_mean"] = ts_wide[cols].mean(axis=1)
                 if len(ts_means.columns) > 1:
+                    overlapping_cols = [c for c in ts_means.columns if c != "PLOT_ID" and c in work.columns]
+                    work = work.drop(columns=overlapping_cols, errors="ignore")
                     work = work.merge(ts_means, on="PLOT_ID", how="left")
                     candidate_cols = [c for c in ts_means.columns if c != "PLOT_ID"]
                     X_df = work[candidate_cols].apply(pd.to_numeric, errors="coerce")
@@ -667,7 +678,7 @@ class AnalysisEngine:
         model_used = "none"
         importances: list[dict] = []
         y_pred = np.full(len(work), np.nan)
-        pred_floor, pred_ceil = 2.5, 3.8
+        pred_floor, pred_ceil = 2.0, 4.0
 
         # ── try SVR ──────────────────────────────────────────────────────────
         svr_path = Path(__file__).resolve().parent / "svr_combined.pkl"
@@ -788,17 +799,6 @@ class AnalysisEngine:
                         fallback_val = float(fallback_vals.iloc[i])
                         fallback_val = float(np.clip(fallback_val, pred_floor, pred_ceil))
                         p["predicted_yield"] = _safe_float(fallback_val)
-
-        # If predictions are all at the upper clip, randomize to avoid a flat line
-        try:
-            pred_vals = [p.get("predicted_yield") for p in preds_with_diff if p.get("predicted_yield") is not None]
-            all_at_ceiling = pred_vals and all(abs(v - pred_ceil) < 1e-9 for v in pred_vals)
-        except Exception:
-            all_at_ceiling = False
-        if all_at_ceiling:
-            rng = np.random.default_rng()
-            for p in preds_with_diff:
-                p["predicted_yield"] = _safe_float(float(rng.uniform(2.0, 3.6)))
         try:
             print(
                 "yield_prediction output sample:",
