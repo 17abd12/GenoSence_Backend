@@ -21,7 +21,6 @@ import jwt
 import boto3
 from google.auth.transport import requests
 from google.oauth2 import id_token
-from botocore.exceptions import ClientError
 from passlib.context import CryptContext
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
@@ -49,6 +48,7 @@ MONGO_DB = os.getenv("MONGO_DB", "genosence")
 JWT_SECRET = os.getenv("JWT_SECRET")
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 IS_PRODUCTION = os.getenv("ENVIRONMENT") == "production" or os.getenv("RAILWAY_ENVIRONMENT") is not None or "railway.app" in os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
 
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
@@ -65,15 +65,11 @@ _sessions: dict[str, dict[str, Any]] = {}
 
 app = FastAPI(title="Agricultural Dashboard API")
 
-dev_origins = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "https://geno-sence-frontend.vercel.app",
-]
+dev_origins = [FRONTEND_ORIGIN, "http://localhost:3000", "https://geno-sence-frontend.vercel.app"]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN, "http://127.0.0.1:3000", "https://geno-sence-frontend.vercel.app"],
+    allow_origins=dev_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -210,14 +206,24 @@ def to_public_user(user: dict[str, Any]) -> UserPublic:
 def get_r2_client():
     if not (R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY):
         return None
-    endpoint = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-    return boto3.client(
-        "s3",
-        endpoint_url=endpoint,
-        aws_access_key_id=R2_ACCESS_KEY_ID,
-        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-        region_name="auto",
-    )
+    host = str(R2_ACCOUNT_ID).strip().removeprefix("https://").removeprefix("http://").strip("/")
+    if not host:
+        return None
+    if ".r2.cloudflarestorage.com" in host:
+        endpoint = f"https://{host}"
+    else:
+        endpoint = f"https://{host}.r2.cloudflarestorage.com"
+    try:
+        return boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            region_name="auto",
+        )
+    except Exception:
+        # R2 is optional; auth and core app flows should continue even when storage config is invalid.
+        return None
 
 
 def ensure_user_r2_prefix(user_id: str) -> None:
@@ -227,7 +233,7 @@ def ensure_user_r2_prefix(user_id: str) -> None:
     key = f"uploads/{user_id}/.keep"
     try:
         client.put_object(Bucket=R2_BUCKET_NAME, Key=key, Body=b"")
-    except ClientError:
+    except Exception:
         pass
 
 
@@ -237,7 +243,10 @@ def upload_bytes_to_r2(user_id: str, content: bytes, filename: str) -> str | Non
         return None
     ext = Path(filename).suffix.lower()
     key = f"uploads/{user_id}/{uuid.uuid4().hex}{ext}"
-    client.put_object(Bucket=R2_BUCKET_NAME, Key=key, Body=content)
+    try:
+        client.put_object(Bucket=R2_BUCKET_NAME, Key=key, Body=content)
+    except Exception:
+        return None
     return key
 
 
