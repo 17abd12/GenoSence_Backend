@@ -413,6 +413,82 @@ class AnalysisEngine:
         hm = (out_df.groupby(["Feature_Category","Yield_Class"])["Z_score"].apply(lambda x: float(np.mean(np.abs(x)))).reset_index().rename(columns={"Z_score":"Mean_Abs_Z"}))
         return {"category_summary":_df_to_records(cat_sum),"heatmap_matrix":_df_to_records(hm)}
 
+    def get_time_series(self) -> dict:
+        df = self._load_temporal()
+        ts_wide = self._load_timestamps_wide()
+        if ts_wide.empty:
+            return {"series": []}
+            
+        geno_info = df[["PLOT_ID", "genotype"]].drop_duplicates("PLOT_ID")
+        merged = ts_wide.merge(geno_info, on="PLOT_ID", how="left")
+        
+        vi_bases = self._detect_vi_bases(df)
+        records = []
+        for _, row in merged.iterrows():
+            plot_id = str(row.get("PLOT_ID", ""))
+            genotype = _safe_float(row.get("genotype"))
+            if pd.isna(genotype): continue
+            
+            for feat in vi_bases:
+                feat_cols = [f"{feat}_t{i}" for i in range(1, 100) if f"{feat}_t{i}" in merged.columns]
+                if not feat_cols: continue
+                vals = [row.get(col, None) for col in feat_cols]
+                if all(pd.isna(v) for v in vals): continue
+                
+                records.append({
+                    "plot_id": plot_id,
+                    "genotype": str(int(genotype)) if float(genotype).is_integer() else str(genotype),
+                    "feature": feat,
+                    "values": [_safe_float(v) for v in vals]
+                })
+        return {"series": records}
+
+    def get_ols_slope_effect(self) -> dict:
+        from scipy.stats import kruskal, linregress
+        df = self._load_temporal()
+        if "Yield" not in df.columns or df["Yield"].isna().all():
+            return {"effects": []}
+            
+        exclude = {"genotype", "Yield", "PLOT_ID", "experiment", "Yield_Class"}
+        candidate_cols = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
+        
+        kruskal_passed = []
+        for col in candidate_cols:
+            groups = [g[col].dropna().values for _, g in df.groupby("genotype")]
+            groups = [g for g in groups if len(g) > 0]
+            if len(groups) > 1:
+                try:
+                    stat, p = kruskal(*groups)
+                    if p < 0.05:
+                        kruskal_passed.append(col)
+                except Exception:
+                    pass
+                    
+        results = []
+        df_clean = df.dropna(subset=["Yield"])
+        y = df_clean["Yield"].values
+        for col in kruskal_passed:
+            sub = df_clean[[col]].copy()
+            mask = sub[col].notna()
+            if mask.sum() < 5:
+                continue
+            x = sub.loc[mask, col].values
+            y_sub = y[mask]
+            
+            try:
+                res = linregress(x, y_sub)
+                results.append({
+                    "feature": col,
+                    "global_slope": float(res.slope),
+                    "p_value": float(res.pvalue),
+                    "is_significant": bool(res.pvalue < 0.05)
+                })
+            except Exception:
+                pass
+                
+        results.sort(key=lambda x: x["global_slope"])
+        return {"effects": results}
+
     def get_yield_prediction(self) -> dict:
         """
         Per-plot yield prediction.
@@ -605,4 +681,14 @@ def get_phenology(): return default_engine.get_phenology()
 def get_feature_interpretation(): return default_engine.get_feature_interpretation()
 def get_outliers(yield_classes=None): return default_engine.get_outliers(yield_classes)
 def get_category_summary(): return default_engine.get_category_summary()
+def get_time_series(): return default_engine.get_time_series()
+def get_ols_slope_effect(): return default_engine.get_ols_slope_effect()
+def get_chat_context(): return default_engine.get_chat_context()
+def get_growth_senescence(): return default_engine.get_growth_senescence()
+def get_phenology(): return default_engine.get_phenology()
+def get_feature_interpretation(): return default_engine.get_feature_interpretation()
+def get_outliers(yield_classes=None): return default_engine.get_outliers(yield_classes)
+def get_category_summary(): return default_engine.get_category_summary()
+def get_time_series(): return default_engine.get_time_series()
+def get_ols_slope_effect(): return default_engine.get_ols_slope_effect()
 def get_chat_context(): return default_engine.get_chat_context()

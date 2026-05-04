@@ -1326,6 +1326,16 @@ def temporal_category_summary(session_id: str | None = Query(default=None)) -> J
     return JSONResponse(_resolve_engine(session_id).get_category_summary())
 
 
+@app.get("/temporal/time-series")
+def temporal_time_series(session_id: str | None = Query(default=None)) -> JSONResponse:
+    return JSONResponse(_resolve_engine(session_id).get_time_series())
+
+
+@app.get("/temporal/ols-slope")
+def temporal_ols_slope(session_id: str | None = Query(default=None)) -> JSONResponse:
+    return JSONResponse(_resolve_engine(session_id).get_ols_slope_effect())
+
+
 @app.get("/temporal/chat-context")
 def temporal_chat_context(session_id: str | None = Query(default=None)) -> JSONResponse:
     return JSONResponse(_resolve_engine(session_id).get_chat_context())
