@@ -49,7 +49,7 @@ MONGO_DB = os.getenv("MONGO_DB", "genosence")
 JWT_SECRET = os.getenv("JWT_SECRET")
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+IS_PRODUCTION = os.getenv("ENVIRONMENT") == "production" or os.getenv("RAILWAY_ENVIRONMENT") is not None or "railway.app" in os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
 
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
@@ -73,8 +73,7 @@ dev_origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=list({FRONTEND_ORIGIN, *dev_origins}),
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_origins=[FRONTEND_ORIGIN, "http://127.0.0.1:3000", "https://geno-sence-frontend.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -103,6 +102,7 @@ class ChatRequest(BaseModel):
     message: str
     history: list[ChatMessage] = []
     context: str | None = None
+    session_id: str | None = None
 
 
 class SignUpRequest(BaseModel):
@@ -371,8 +371,8 @@ def auth_signup(payload: SignUpRequest) -> JSONResponse:
         key="access_token",
         value=token,
         httponly=True,
-        samesite="lax",
-        secure=False,
+        samesite="none" if IS_PRODUCTION else "lax",
+        secure=IS_PRODUCTION,
         max_age=JWT_EXPIRE_MINUTES * 60,
     )
     return response
@@ -392,8 +392,8 @@ def auth_signin(payload: SignInRequest) -> JSONResponse:
         key="access_token",
         value=token,
         httponly=True,
-        samesite="lax",
-        secure=False,
+        samesite="none" if IS_PRODUCTION else "lax",
+        secure=IS_PRODUCTION,
         max_age=JWT_EXPIRE_MINUTES * 60,
     )
     return response
@@ -402,7 +402,11 @@ def auth_signin(payload: SignInRequest) -> JSONResponse:
 @app.post("/auth/signout")
 def auth_signout() -> JSONResponse:
     response = JSONResponse({"ok": True})
-    response.delete_cookie("access_token")
+    response.delete_cookie(
+        "access_token",
+        samesite="none" if IS_PRODUCTION else "lax",
+        secure=IS_PRODUCTION
+    )
     return response
 
 
@@ -414,85 +418,15 @@ def auth_me(request: Request) -> JSONResponse:
     return JSONResponse({"user": to_public_user(user).model_dump()})
 
 
-@app.post("/auth/google-signup")
-def auth_google_signup(payload: GoogleTokenRequest) -> JSONResponse:
-    """Authenticate and create/get user from Google OAuth token."""
-    try:
-        token = getattr(payload, "token", "")
-        id_info = _verify_google_token(token)
-        email = str(id_info.get("email", "")).strip().lower()
-        name = str(id_info.get("name") or "Google User").strip() or "Google User"
-
-        users = get_users_collection()
-        user = users.find_one({"email": email})
-
-        if not user:
-            user_doc = {
-                "name": name,
-                "email": email,
-                "password_hash": None,
-                "google_id": id_info.get("sub"),
-                "created_at": datetime.now(tz=timezone.utc).isoformat(),
-                "last_processed_files": None,
-            }
-            result = users.insert_one(user_doc)
-            user_id = str(result.inserted_id)
-            ensure_user_r2_prefix(user_id)
-            user = users.find_one({"_id": ObjectId(user_id)})
-        else:
-            if not user.get("google_id"):
-                users.update_one(
-                    {"_id": user["_id"]},
-                    {"$set": {"google_id": id_info.get("sub")}},
-                )
-
-        token = create_access_token(str(user["_id"]), email)
-        response = JSONResponse({"user": to_public_user(user).model_dump(), "access_token": token})
-        response.set_cookie(
-            key="access_token",
-            value=token,
-            httponly=True,
-            samesite="lax",
-            secure=False,
-            max_age=JWT_EXPIRE_MINUTES * 60,
-        )
-        return response
-    except Exception as e:
-        print("Google signup failure:", repr(e))
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Authentication error: {str(e)}")
-
-
-@app.post("/auth/google-signin")
-def auth_google_signin(payload: GoogleTokenRequest) -> JSONResponse:
-    """Authenticate user with Google OAuth token."""
-    try:
-        token = getattr(payload, "token", "")
-        id_info = _verify_google_token(token)
-        email = str(id_info.get("email", "")).strip().lower()
-
-        users = get_users_collection()
-        user = users.find_one({"email": email})
-
-        if not user:
-            raise HTTPException(status_code=401, detail="User not found. Please sign up first.")
-
-        token = create_access_token(str(user["_id"]), email)
-        response = JSONResponse({"user": to_public_user(user).model_dump(), "access_token": token})
-        response.set_cookie(
-            key="access_token",
-            value=token,
-            httponly=True,
-            samesite="lax",
-            secure=False,
-            max_age=JWT_EXPIRE_MINUTES * 60,
-        )
-        return response
-    except Exception as e:
-        print("Google signin failure:", repr(e))
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Authentication error: {str(e)}")
-
+@app.get("/user/last-upload/info")
+def get_user_last_upload_info(request: Request) -> JSONResponse:
+    user = get_current_user(request)
+    if not user:
+        return JSONResponse({"session_id": None})
+    temporal_doc = _get_last_temporal_doc(user)
+    if temporal_doc and "session_id" in temporal_doc:
+        return JSONResponse({"session_id": temporal_doc["session_id"]})
+    return JSONResponse({"session_id": None})
 
 # ─────────────────────────────────────────────────────────────────
 # File serving
@@ -594,18 +528,26 @@ def delete_user_upload_data(user_id: str) -> None:
 
 
 def store_temporal_features(user_id: str, session_id: str, temporal_df: pd.DataFrame) -> list[str]:
+    """Upsert: one temporal-features document per user."""
     collection = get_temporal_collection()
     records = temporal_df.to_dict(orient="records")
     if not records:
         return []
-    doc = {
-        "user_id": user_id,
-        "session_id": session_id,
-        "records": records,
-        "created_at": datetime.now(tz=timezone.utc).isoformat(),
-    }
-    result = collection.insert_one(doc)
-    return [str(result.inserted_id)]
+    now = datetime.now(tz=timezone.utc).isoformat()
+    result = collection.update_one(
+        {"user_id": user_id},
+        {"$set": {
+            "user_id": user_id,
+            "session_id": session_id,
+            "records": records,
+            "updated_at": now,
+        }, "$setOnInsert": {"created_at": now}},
+        upsert=True,
+    )
+    if result.upserted_id:
+        return [str(result.upserted_id)]
+    doc = collection.find_one({"user_id": user_id}, {"_id": 1})
+    return [str(doc["_id"])] if doc else []
 
 
 def _extract_date_label(name: str) -> str:
@@ -638,6 +580,32 @@ def store_timestamps(user_id: str, session_id: str, timestamps_dir: Path) -> lis
     }
     result = collection.insert_one(doc)
     return [str(result.inserted_id)]
+
+
+def store_shapefile_geojson(
+    user_id: str,
+    session_id: str,
+    geojson_data: dict[str, Any],
+    filename: str | None,
+) -> str:
+    """Upsert: one shapefile document per user."""
+    collection = get_shapefiles_collection()
+    now = datetime.now(tz=timezone.utc).isoformat()
+    result = collection.update_one(
+        {"user_id": user_id},
+        {"$set": {
+            "user_id": user_id,
+            "session_id": session_id,
+            "filename": filename,
+            "geojson": geojson_data,
+            "updated_at": now,
+        }, "$setOnInsert": {"created_at": now}},
+        upsert=True,
+    )
+    if result.upserted_id:
+        return str(result.upserted_id)
+    doc = collection.find_one({"user_id": user_id}, {"_id": 1})
+    return str(doc["_id"]) if doc else ""
 
 
 def update_user_last_processed_files(
@@ -698,24 +666,297 @@ def process_reflectance_pair(rgb_path: Path, nir_path: Path, band_mapping: dict,
     For now we produce a stub STATS CSV that the analysis engine can consume.
     Returns path to the STATS CSV.
     """
-    # Derive genotypes from shapefile properties
+    # Read rasters and compute per-plot VI stats from pixel values.
+    try:
+        import rasterio
+        from rasterio.mask import mask as rio_mask
+        from rasterio.warp import transform_bounds
+        from shapely.geometry import shape as geom_shape
+        from shapely.ops import transform as transform_geom
+        import pyproj
+    except Exception:
+        # If rasterio/shapely isn't installed, fall back to stub behavior (NaN stats)
+        rows = []
+        for feat in shapefile_geojson.get("features", []):
+            props = feat.get("properties", {})
+            plot_id = str(props.get("PLOT_ID", props.get("plot_id", "")))
+            parts = plot_id.split("_")
+            genotype = parts[-1] if parts else "0"
+            row = {"PLOT_ID": plot_id, "genotype": genotype}
+            for vi in VI_COLS:
+                for stat in STAT_AGG:
+                    row[f"{vi}_{stat}"] = np.nan
+            rows.append(row)
+        df = pd.DataFrame(rows)
+        out_path = out_dir / f"{timestamp_label}_STATS.csv"
+        df.to_csv(out_path, index=False)
+        return out_path
+
+    # Helper for safe statistic calculation
+    def _safe_stats(arr: np.ndarray) -> dict:
+        a = arr.astype(float)
+        a = a[~np.isnan(a)]
+        if a.size == 0:
+            return {s: np.nan for s in STAT_AGG}
+        return {
+            "sum": float(np.nansum(a)),
+            "count": int(a.size),
+            "mean": float(np.nanmean(a)),
+            "median": float(np.nanmedian(a)),
+            "std": float(np.nanstd(a, ddof=0)),
+            "var": float(np.nanvar(a, ddof=0)),
+            "min": float(np.nanmin(a)),
+            "max": float(np.nanmax(a)),
+        }
+
+    # Open rasters
+    src_rgb = rasterio.open(rgb_path)
+    src_nir = rasterio.open(nir_path)
+    print(f"Opened rasters for {timestamp_label}:")
+    print(f"  RGB: shape={src_rgb.shape}, count={src_rgb.count} bands, crs={src_rgb.crs}, dtype={src_rgb.dtypes}")
+    print(f"  NIR: shape={src_nir.shape}, count={src_nir.count} bands, crs={src_nir.crs}, dtype={src_nir.dtypes}")
+    print(f"Band mapping: {band_mapping}")
+
+    # Get raster CRS for geometry reprojection
+    raster_crs = src_rgb.crs
+    if not raster_crs:
+        print(f"WARNING: Raster has no CRS; assuming EPSG:4326")
+        raster_crs = pyproj.CRS("EPSG:4326")
+    else:
+        raster_crs = pyproj.CRS.from_string(str(raster_crs))
+
+    # Build transformer for GeoJSON (assumed EPSG:4326) -> raster CRS
+    try:
+        geojson_crs = pyproj.CRS("EPSG:4326")
+        if geojson_crs != raster_crs:
+            transformer = pyproj.Transformer.from_crs(geojson_crs, raster_crs, always_xy=True)
+            print(f"Will reproject geometries from EPSG:4326 to {raster_crs}")
+        else:
+            transformer = None
+            print(f"GeoJSON and raster CRS both {raster_crs}; no reprojection needed")
+    except Exception as e:
+        print(f"Failed to build transformer: {e}; no reprojection")
+        transformer = None
+
+    def reproject_geom(geom_dict, transformer):
+        """Reproject GeoJSON geometry dict to raster CRS."""
+        if not transformer:
+            return geom_dict
+        try:
+            geom_shape_obj = geom_shape(geom_dict)
+            reprojected = transform_geom(transformer.transform, geom_shape_obj)
+            return reprojected.__geo_interface__
+        except Exception as e:
+            print(f"Reprojection failed: {e}")
+            return geom_dict
+
     rows = []
     for feat in shapefile_geojson.get("features", []):
         props = feat.get("properties", {})
         plot_id = str(props.get("PLOT_ID", props.get("plot_id", "")))
-        # Genotype is last segment of PLOT_ID separated by "_"
         parts = plot_id.split("_")
         genotype = parts[-1] if parts else "0"
-        rows.append({"PLOT_ID": plot_id, "genotype": genotype})
+        geom = feat.get("geometry")
+        if geom is None:
+            print(f"{plot_id}: no geometry!")
+            continue
+
+        # Reproject geometry if needed
+        geom = reproject_geom(geom, transformer)
+        print(f"Processing {plot_id} with geometry type {geom.get('type')}")
+
+        row = {"PLOT_ID": plot_id, "genotype": genotype}
+
+        try:
+            # rio_mask expects geometry as GeoJSON-like dict or shapely geometry
+            # Convert dict to shapely if needed
+            if isinstance(geom, dict):
+                geom_for_mask = [geom_shape(geom)]
+            else:
+                geom_for_mask = [geom]
+            
+            rgb_masked, rgb_transform = rio_mask(src_rgb, geom_for_mask, crop=True, nodata=np.nan)
+            print(f"  {plot_id}: RGB masked shape={rgb_masked.shape}, dtype={rgb_masked.dtype}, has NaN: {np.isnan(rgb_masked).all()}")
+        except Exception as e:
+            print(f"  {plot_id}: RGB masking failed: {type(e).__name__}: {e}")
+            rgb_masked = None
+
+        try:
+            if isinstance(geom, dict):
+                geom_for_mask = [geom_shape(geom)]
+            else:
+                geom_for_mask = [geom]
+            
+            nir_masked, nir_transform = rio_mask(src_nir, geom_for_mask, crop=True, nodata=np.nan)
+            print(f"  {plot_id}: NIR masked shape={nir_masked.shape}, dtype={nir_masked.dtype}, has NaN: {np.isnan(nir_masked).all()}")
+        except Exception as e:
+            print(f"  {plot_id}: NIR masking failed: {type(e).__name__}: {e}")
+            nir_masked = None
+
+        # Build a dict of available bands per pixel
+        bands: dict[str, np.ndarray] = {}
+        # band_mapping values are 1-based indices; ensure within range
+        try:
+            if rgb_masked is not None:
+                # rgb_masked shape = (bands, H, W)
+                br = band_mapping.get("band_red", 1)
+                bg = band_mapping.get("band_green", 2)
+                bb = band_mapping.get("band_blue", 3)
+                # Ensure indices within available bands
+                for name, idx in [("Red", br), ("Green", bg), ("Blue", bb)]:
+                    if 1 <= idx <= rgb_masked.shape[0]:
+                        bands[name] = rgb_masked[idx - 1].astype(float)
+                print(f"  {plot_id}: extracted RGB bands: {list(bands.keys())}")
+        except Exception as e:
+            print(f"  {plot_id}: RGB band extraction failed: {e}")
+
+        try:
+            if nir_masked is not None:
+                bn = band_mapping.get("band_nir", 1)
+                if 1 <= bn <= nir_masked.shape[0]:
+                    bands["NIR"] = nir_masked[bn - 1].astype(float)
+                    print(f"  {plot_id}: extracted NIR band, bands now: {list(bands.keys())}")
+        except Exception as e:
+            print(f"  {plot_id}: NIR band extraction failed: {e}")
+
+        # Try to get Rededge from either NIR file or RGB if provided
+        try:
+            bre = band_mapping.get("band_rededge")
+            if bre is not None:
+                # check NIR first
+                if nir_masked is not None and 1 <= bre <= nir_masked.shape[0]:
+                    bands["Rededge"] = nir_masked[bre - 1].astype(float)
+                    print(f"  {plot_id}: extracted Rededge from NIR")
+                elif rgb_masked is not None and 1 <= bre <= rgb_masked.shape[0]:
+                    bands["Rededge"] = rgb_masked[bre - 1].astype(float)
+                    print(f"  {plot_id}: extracted Rededge from RGB")
+        except Exception as e:
+            print(f"  {plot_id}: Rededge extraction failed: {e}")
+
+        print(f"  {plot_id}: final bands dict: {list(bands.keys())}")
+
+        # Compute VIs; where input bands missing, result will be NaN
+        vi_arrays: dict[str, np.ndarray] = {}
+        # Create a mask of valid pixels where any band is finite
+        valid_mask = None
+        for b in bands.values():
+            finite = np.isfinite(b)
+            valid_mask = finite if valid_mask is None else (valid_mask & finite)
+
+        # If no full-band valid_mask, allow per-formula masked calculations (use nan-safe ops)
+        for vi_name, fn in VI_FORMULAS.items():
+            try:
+                # Prepare a small dict of arrays for lambda evaluation
+                env = {}
+                for key in ("NIR", "Rededge", "Red", "Blue", "Green"):
+                    env[key] = bands.get(key, np.full_like(next(iter(bands.values())), np.nan)) if bands else np.array([np.nan])
+                arr = fn(env)
+                # Ensure array shape flattened to 1D for stats
+                if isinstance(arr, np.ndarray):
+                    vi_arrays[vi_name] = arr
+                else:
+                    vi_arrays[vi_name] = np.array(arr)
+                # Check if any finite values
+                if isinstance(arr, np.ndarray):
+                    finite_count = np.isfinite(arr).sum()
+                    print(f"  {plot_id}: {vi_name} has {finite_count} finite values out of {arr.size}")
+            except Exception as e:
+                print(f"  {plot_id}: VI formula {vi_name} failed: {e}")
+                vi_arrays[vi_name] = np.array([np.nan])
+
+        # Calculate stats for each VI and add to row
+        for vi, arr in vi_arrays.items():
+            # Flatten and drop NaNs
+            if arr is None:
+                stats = {s: np.nan for s in STAT_AGG}
+            else:
+                flat = arr.flatten()
+                stats = _safe_stats(flat)
+            for s, val in stats.items():
+                row[f"{vi}_{s}"] = val
+
+        rows.append(row)
+
+    # Close datasets
+    try:
+        src_rgb.close()
+    except Exception:
+        pass
+    try:
+        src_nir.close()
+    except Exception:
+        pass
 
     df = pd.DataFrame(rows)
-    for vi in VI_COLS:
-        for stat in STAT_AGG:
-            df[f"{vi}_{stat}"] = np.nan
-
+    if not df.empty:
+        print(f"/upload/reflectance-maps: extracted values for {timestamp_label}")
+        print(df.to_string(index=False))
+    else:
+        print(f"/upload/reflectance-maps: no plot rows extracted for {timestamp_label}")
     out_path = out_dir / f"{timestamp_label}_STATS.csv"
     df.to_csv(out_path, index=False)
     return out_path
+
+
+def build_temporal_summary_from_stats(
+    stats_paths: list[Path],
+    geojson_data: dict[str, Any],
+) -> pd.DataFrame:
+    """Aggregate per-timestamp STATS CSVs into one per-plot temporal table."""
+    base_rows: list[dict[str, Any]] = []
+    for feat in geojson_data.get("features", []):
+        props = feat.get("properties", {})
+        plot_id = str(props.get("PLOT_ID", props.get("plot_id", "")))
+        if not plot_id:
+            continue
+        parts = plot_id.split("_")
+        genotype = parts[-1] if parts else "0"
+        base_rows.append({
+            "PLOT_ID": plot_id,
+            "genotype": genotype,
+            "Yield": props.get("Yield", np.nan),
+        })
+
+    base_df = pd.DataFrame(base_rows).drop_duplicates("PLOT_ID")
+    if base_df.empty:
+        return base_df
+
+    long_frames: list[pd.DataFrame] = []
+    for ts_idx, stats_path in enumerate(stats_paths, start=1):
+        try:
+            ts_df = pd.read_csv(stats_path)
+        except Exception:
+            continue
+        ts_df.columns = ts_df.columns.str.strip()
+        if "PLOT_ID" not in ts_df.columns:
+            continue
+        ts_df = ts_df.copy()
+        ts_df["timestamp_idx"] = ts_idx
+        long_frames.append(ts_df)
+
+    if not long_frames:
+        return base_df
+
+    long_df = pd.concat(long_frames, ignore_index=True, sort=False)
+    long_df["PLOT_ID"] = long_df["PLOT_ID"].astype(str)
+
+    summary = base_df.copy()
+    for vi in VI_COLS:
+        mean_col = f"{vi}_mean"
+        if mean_col not in long_df.columns:
+            continue
+        working = long_df[["PLOT_ID", mean_col]].copy()
+        working[mean_col] = pd.to_numeric(working[mean_col], errors="coerce")
+        agg = working.groupby("PLOT_ID")[mean_col].agg(["mean", "std", "max", "min"]).reset_index()
+        agg = agg.rename(columns={
+            "mean": f"{vi}_mean",
+            "std": f"{vi}_std",
+            "max": f"{vi}_max",
+            "min": f"{vi}_min",
+        })
+        summary = summary.merge(agg, on="PLOT_ID", how="left")
+
+    return summary
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -793,38 +1034,27 @@ async def upload_reflectance_maps(
         rgb_path.write_bytes(content_rgb)
         nir_path.write_bytes(content_nir)
 
+        # Keep source tif files local only. We upload only extracted CSV values.
         if user_id:
-            try:
-                rgb_key = upload_bytes_to_r2(user_id, content_rgb, rgb_file.filename)
-                nir_key = upload_bytes_to_r2(user_id, content_nir, nir_file.filename)
-                if rgb_key:
-                    reflectance_keys.append(rgb_key)
-                    print(f"/upload/reflectance-maps: uploaded RGB {rgb_file.filename} -> {rgb_key}")
-                if nir_key:
-                    reflectance_keys.append(nir_key)
-                    print(f"/upload/reflectance-maps: uploaded NIR {nir_file.filename} -> {nir_key}")
-            except Exception as exc:
-                print(f"/upload/reflectance-maps: failed to upload reflectance maps: {exc}")
+            print(
+                f"/upload/reflectance-maps: keeping source rasters local for {label}; "
+                f"not uploading {rgb_file.filename} / {nir_file.filename} to cloud storage"
+            )
 
         stats_df = process_reflectance_pair(
             rgb_path, nir_path, band_info, geojson_data, label, ts_dir
         )
         stats_files.append(stats_df.name if isinstance(stats_df, Path) else str(stats_df))
 
-    # Build a temporal CSV from genotype info in GeoJSON
-    rows = []
-    for feat in geojson_data.get("features", []):
-        props = feat.get("properties", {})
-        plot_id = str(props.get("PLOT_ID", props.get("plot_id", "")))
-        parts = plot_id.split("_")
-        genotype = parts[-1] if parts else "0"
-        rows.append({
-            "PLOT_ID": plot_id,
-            "genotype": genotype,
-            "Yield": props.get("Yield", np.nan),
-        })
+        try:
+            extracted_df = pd.read_csv(ts_dir / stats_files[-1])
+            print(f"/upload/reflectance-maps: timestamp {label} extracted CSV rows")
+            print(extracted_df.to_string(index=False))
+        except Exception as exc:
+            print(f"/upload/reflectance-maps: failed to read extracted stats for {label}: {exc}")
 
-    temporal_df = pd.DataFrame(rows)
+    # Build a temporal CSV from per-timestamp VI statistics.
+    temporal_df = build_temporal_summary_from_stats([ts_dir / name for name in stats_files], geojson_data)
     temporal_path = tmp_dir / "temporalDataSet.csv"
     temporal_df.to_csv(temporal_path, index=False)
 
@@ -931,17 +1161,47 @@ async def upload_temporal_csvs(
     # Process each timestamp pixel CSV → STATS CSV
     processed_labels: list[str] = []
     errors: list[str] = []
+    warnings_list: list[str] = []
 
     for i, ts_file in enumerate(timestamp_csvs):
-        label = f"t{i+1}"
+        label = _extract_date_label(ts_file.filename or f"t{i+1}")
+        if not label:
+            label = f"t{i+1}"
         try:
             ts_bytes = await ts_file.read()
-            pixel_path = tmp_dir / f"pixels_{i}.csv"
-            pixel_path.write_bytes(ts_bytes)
-            stats_df = compute_vi_stats(pixel_path)
-            out_name = f"final_{label}_STATS.csv"
-            stats_df.to_csv(ts_dir / out_name, index=False)
-            processed_labels.append(label)
+            df_ts = pd.read_csv(io.BytesIO(ts_bytes))
+            df_ts.columns = df_ts.columns.str.strip()
+
+            # Detect format: does this CSV already have pre-computed _mean stats?
+            has_precomputed = any(c.endswith("_mean") for c in df_ts.columns)
+            has_plot_id = "PLOT_ID" in df_ts.columns
+
+            if has_precomputed and has_plot_id:
+                # Format B: already-computed VI stats (e.g. sample timestamp files)
+                # Write directly as STATS CSV
+                out_name = f"final_{label}_STATS.csv"
+                df_ts.to_csv(ts_dir / out_name, index=False)
+                processed_labels.append(label)
+                warnings_list.append(
+                    f"Timestamp {i+1} ({ts_file.filename}): used pre-computed VI stats directly."
+                )
+            else:
+                # Format A: raw pixel CSV — try to compute VIs
+                required_band_cols = {"Red", "Green", "Blue", "NIR", "Rededge"}
+                missing = required_band_cols - set(df_ts.columns)
+                if missing:
+                    errors.append(
+                        f"Timestamp {i+1} ({ts_file.filename}): CSV missing columns: {missing}. "
+                        "Upload either raw pixel CSVs (Red/Green/Blue/NIR/Rededge) or pre-computed STATS CSVs (_mean columns)."
+                    )
+                    continue
+                pixel_path = tmp_dir / f"pixels_{i}.csv"
+                pixel_path.write_bytes(ts_bytes)
+                from analysis_helpers import compute_vi_stats  # type: ignore[import]
+                stats_df = compute_vi_stats(pixel_path)
+                out_name = f"final_{label}_STATS.csv"
+                stats_df.to_csv(ts_dir / out_name, index=False)
+                processed_labels.append(label)
         except Exception as exc:
             errors.append(f"Timestamp {i+1} ({ts_file.filename}): {exc}")
 
@@ -1008,6 +1268,7 @@ async def upload_temporal_csvs(
         "processed_timestamps": len(processed_labels),
         "timestamp_labels": processed_labels,
         "errors": errors,
+        "warnings": warnings_list,
         "has_shapefile": geojson_path is not None,
         "message": "Temporal CSVs processed. Use session_id in analysis requests.",
     })
@@ -1153,6 +1414,96 @@ async def upload_temporal_csv_only(
 
 
 # ─────────────────────────────────────────────────────────────────
+# Upload: Mode D – Shapefile only (visualize on map)
+# ─────────────────────────────────────────────────────────────────
+
+@app.post("/upload/shapefile-only")
+async def upload_shapefile_only(
+    request: Request,
+    shapefile_json: UploadFile = File(..., description="Shapefile as GeoJSON"),
+) -> JSONResponse:
+    """
+    Accept a GeoJSON shapefile and store it for map visualization.
+    Creates a minimal temporal CSV (PLOT_ID + genotype) from the shapefile
+    properties so the session can be used for other endpoints without crashing.
+    """
+    import json as json_module
+
+    session_id = str(uuid.uuid4())
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"session_{session_id}_"))
+    ts_dir = tmp_dir / "timestamps"
+    ts_dir.mkdir()
+
+    geojson_bytes = await shapefile_json.read()
+    try:
+        geojson_data = json_module.loads(geojson_bytes.decode("utf-8"))
+    except Exception as exc:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(400, f"Invalid GeoJSON: {exc}")
+
+    feature_count = len(geojson_data.get("features", []))
+    geojson_path = tmp_dir / "plots.geojson"
+    geojson_path.write_text(json_module.dumps(geojson_data))
+
+    # Build minimal temporal CSV from shapefile feature properties
+    rows = []
+    for feat in geojson_data.get("features", []):
+        props = feat.get("properties", {})
+        plot_id = str(props.get("PLOT_ID", props.get("plot_id", props.get("Plot_ID", ""))))
+        raw_geno = props.get("genotype", props.get("GENOTYPE", ""))
+        if raw_geno not in (None, ""):
+            genotype = raw_geno
+        elif "_" in plot_id:
+            genotype = plot_id.split("_")[-1]
+        else:
+            genotype = 0
+        rows.append({"PLOT_ID": plot_id, "genotype": genotype})
+
+    temporal_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["PLOT_ID", "genotype"])
+    temporal_path = tmp_dir / "temporalDataSet.csv"
+    temporal_df.to_csv(temporal_path, index=False)
+
+    _sessions[session_id] = {
+        "temporal_csv": temporal_path,
+        "timestamps_dir": ts_dir,
+        "geojson": geojson_path,
+        "mode": "shapefile-only",
+        "timestamp_count": 0,
+        "timestamp_labels": [],
+    }
+    analysis.invalidate_session_cache(session_id)
+
+    user = get_current_user(request)
+    shapefile_id = None
+    if user:
+        user_id = str(user["_id"])
+        ensure_user_r2_prefix(user_id)
+        shapefile_key = None
+        temporal_ids: list[str] = []
+        try:
+            shapefile_key = upload_bytes_to_r2(user_id, geojson_bytes, shapefile_json.filename)
+        except Exception:
+            pass
+        try:
+            delete_user_upload_data(user_id)
+            temporal_ids = store_temporal_features(user_id, session_id, temporal_df)
+            shapefile_id = store_shapefile_geojson(user_id, session_id, geojson_data, shapefile_json.filename)
+        except Exception as exc:
+            print(f"/upload/shapefile-only: Mongo write failed: {exc}")
+        update_user_last_processed_files(
+            user_id, None, shapefile_key, [], [],
+            temporal_ids=temporal_ids, shapefile_id=shapefile_id,
+        )
+
+    return JSONResponse({
+        "session_id": session_id,
+        "feature_count": feature_count,
+        "has_shapefile": True,
+        "message": f"Shapefile loaded with {feature_count} features. Redirect to dashboard to visualize.",
+    })
+
+
+# ─────────────────────────────────────────────────────────────────
 # Session GeoJSON endpoint
 # ─────────────────────────────────────────────────────────────────
 
@@ -1225,11 +1576,26 @@ def user_last_upload_info(request: Request) -> JSONResponse:
     })
 
 
+@app.post("/user/reset-upload")
+def reset_user_upload(request: Request) -> JSONResponse:
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        delete_user_upload_data(str(user["_id"]))
+        update_user_last_processed_files(str(user["_id"]), None, None, [], [])
+        return JSONResponse({"message": "User upload data reset successfully. Dashboard will now show sample data."})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ─────────────────────────────────────────────────────────────────
 # Helper: resolve analysis engine for session or default
 # ─────────────────────────────────────────────────────────────────
 
 def _resolve_engine(session_id: str | None) -> analysis.AnalysisEngine:
+    import json as _json, tempfile as _tmp
+    # 1. Session is alive in memory
     if session_id and session_id in _sessions:
         sess = _sessions[session_id]
         return analysis.AnalysisEngine(
@@ -1237,6 +1603,56 @@ def _resolve_engine(session_id: str | None) -> analysis.AnalysisEngine:
             timestamps_dir=sess["timestamps_dir"],
             session_id=session_id,
         )
+    # 2. Session ID provided but server restarted — try to rebuild from MongoDB
+    if session_id and mongo_client:
+        try:
+            temporal_doc = get_temporal_collection().find_one({"session_id": session_id})
+            shapefile_doc = get_shapefiles_collection().find_one({"session_id": session_id})
+            if temporal_doc:
+                tmp_dir = Path(_tmp.mkdtemp(prefix=f"restore_{session_id}_"))
+                ts_dir = tmp_dir / "timestamps"
+                ts_dir.mkdir()
+                records = temporal_doc.get("records", [])
+                temporal_df = pd.DataFrame(records) if records else pd.DataFrame()
+                temporal_path = tmp_dir / "temporalDataSet.csv"
+                temporal_df.to_csv(temporal_path, index=False)
+                ts_labels: list[str] = []
+                ts_doc = get_timestamps_collection().find_one({
+                    "session_id": session_id,
+                    "user_id": temporal_doc.get("user_id"),
+                })
+                if ts_doc:
+                    import re as _re
+                    for idx, ts in enumerate(ts_doc.get("timestamps", []), start=1):
+                        label = str(ts.get("date") or f"t{idx}")
+                        safe_label = _re.sub(r"[^0-9A-Za-z_\-]", "_", label)
+                        ts_labels.append(safe_label)
+                        ts_records = ts.get("records", [])
+                        if ts_records:
+                            ts_df = pd.DataFrame(ts_records)
+                            ts_df.to_csv(ts_dir / f"final_{safe_label}.csv", index=False)
+                geojson_path: Path | None = None
+                if shapefile_doc:
+                    geojson_path = tmp_dir / "plots.geojson"
+                    geojson_path.write_text(_json.dumps(shapefile_doc.get("geojson", {})))
+                _sessions[session_id] = {
+                    "temporal_csv": temporal_path,
+                    "timestamps_dir": ts_dir,
+                    "geojson": geojson_path,
+                    "mode": "restored",
+                    "timestamp_count": len(ts_labels),
+                    "timestamp_labels": ts_labels,
+                }
+                analysis.invalidate_session_cache(session_id)
+                print(f"_resolve_engine: restored session {session_id} from MongoDB")
+                return analysis.AnalysisEngine(
+                    temporal_csv=temporal_path,
+                    timestamps_dir=ts_dir,
+                    session_id=session_id,
+                )
+        except Exception as exc:
+            print(f"_resolve_engine: MongoDB restore failed for {session_id}: {exc}")
+    # 3. No session — fall back to user's last upload, then sample data
     return analysis.default_engine
 
 
@@ -1290,6 +1706,16 @@ def temporal_outliers(
 @app.get("/temporal/category-summary")
 def temporal_category_summary(session_id: str | None = Query(default=None)) -> JSONResponse:
     return JSONResponse(_resolve_engine(session_id).get_category_summary())
+
+
+@app.get("/temporal/time-series")
+def temporal_time_series(session_id: str | None = Query(default=None)) -> JSONResponse:
+    return JSONResponse(_resolve_engine(session_id).get_time_series())
+
+
+@app.get("/temporal/ols-slope")
+def temporal_ols_slope(session_id: str | None = Query(default=None)) -> JSONResponse:
+    return JSONResponse(_resolve_engine(session_id).get_ols_slope_effect())
 
 
 @app.get("/temporal/chat-context")
@@ -1358,29 +1784,142 @@ def yield_prediction(session_id: str | None = Query(default=None)) -> JSONRespon
 # Chat endpoint
 # ─────────────────────────────────────────────────────────────────
 
+# ── Vegetation-index reference (injected into every chat system prompt) ─────────
+VI_GLOSSARY = """
+VEGETATION INDEX REFERENCE (authoritative definitions — always use these):
+• NDVI  (Normalized Difference Vegetation Index): measures green biomass / photosynthetic
+  activity.  Range −1 to +1.  Higher = healthier, denser canopy.  Drops sharply during
+  senescence or water stress.
+• NDWI  (Normalized Difference Water Index): measures LIQUID WATER CONTENT in the canopy.
+  Higher NDWI = more water stored in leaves = lower water stress.  Negative or very low
+  NDWI = drought / dehydration stress.
+• NDRE  (Normalized Difference Red Edge): sensitive to chlorophyll concentration, especially
+  useful for detecting early nutrient stress before NDVI changes.  Higher = more chlorophyll.
+• MTCI  (MERIS Terrestrial Chlorophyll Index): tracks chlorophyll via red-edge contrast.
+  High MTCI ↔ abundant chlorophyll and active photosynthesis.
+• NDCI  (Normalized Difference Chlorophyll Index): alternative chlorophyll proxy (red-edge/red
+  ratio).  Higher = more chlorophyll.
+• MSI   (Moisture Stress Index): Red/NIR ratio — INVERSE of water status.  HIGH MSI = high
+  water stress / moisture deficit.  LOW MSI = well-watered crop.
+• WI    (Water Index): NIR/Green ratio — higher = more water content in vegetation.
+• SAVI  (Soil-Adjusted Vegetation Index): NDVI corrected for soil background reflectance;
+  more reliable at low canopy cover.
+• EVI   (Enhanced Vegetation Index): improved NDVI for high-biomass / high-LAI conditions;
+  less prone to saturation.
+• EXG   (Excess Green Index): 2G−R−B — emphasises green pigmentation; used for canopy
+  cover estimation in RGB imagery.
+• CIgreen (Chlorophyll Index Green): (NIR/Green)−1; tracks chlorophyll content from green
+  reflectance.
+• PSRI  (Plant Senescence Reflectance Index): (Red−Green)/NIR — rises as carotenoids
+  increase relative to chlorophyll; HIGH PSRI = active senescence / leaf aging.
+• SIPI  (Structure Insensitive Pigment Index): carotenoid-to-chlorophyll ratio proxy;
+  HIGH SIPI = stressed or senescing tissue.
+• Yield_Class: categorical performance bin — Low / Medium / High — derived from the
+  33rd and 66th percentile of mean yield across all genotypes.
+• CV (Coefficient of Variation): yield variability across plots.  <10% = very stable;
+  10–25% = moderate; >25% = high variation.
+"""
+
+
+def _build_csv_context(session_id: str | None, extra_context: str | None) -> str:
+    """Return the temporal CSV as a text table for the system prompt (max 100 rows)."""
+    csv_block = ""
+
+    def _format_df(df: pd.DataFrame) -> str:
+        df.columns = df.columns.str.strip()
+        if len(df) > 100:
+            df = df.sample(n=100, random_state=42)
+        return df.to_csv(index=False)
+
+    # 1. Try session in memory
+    if session_id and session_id in _sessions:
+        csv_path = _sessions[session_id].get("temporal_csv")
+        if csv_path and Path(csv_path).exists():
+            try:
+                df = pd.read_csv(csv_path)
+                csv_block = _format_df(df)
+            except Exception:
+                pass
+
+    # 2. Try MongoDB if session not in memory
+    if not csv_block and session_id and mongo_client:
+        try:
+            doc = get_temporal_collection().find_one({"session_id": session_id})
+            if doc and doc.get("records"):
+                df = pd.DataFrame(doc["records"])
+                csv_block = _format_df(df)
+        except Exception:
+            pass
+
+    # 3. Fallback → load the FULL sample temporal CSV from disk
+    if not csv_block:
+        try:
+            sample_csv = SAMPLES_DIR / "temporalDataSet.csv"
+            df_sample = pd.read_csv(sample_csv)
+            csv_block = _format_df(df_sample)
+        except Exception:
+            pass
+    # Last resort: compact engine summary
+    if not csv_block:
+        try:
+            eng = _resolve_engine(session_id)
+            ctx = eng.get_chat_context()
+            csv_block = ctx.get("context", "")
+        except Exception:
+            pass
+
+    if extra_context:
+        csv_block = (csv_block + "\n" + extra_context).strip()
+
+    return csv_block
+
+
 @app.post("/chat")
 def chat(req: ChatRequest) -> JSONResponse:
     if not openai_client:
         raise HTTPException(status_code=500, detail="GPT_API_KEY is not set")
 
-    context = compact_context(req.context)
+    # Build data context from the session CSV (or sample data if no session)
+    data_context = _build_csv_context(req.session_id, req.context)
+
     system_prompt = (
-        "You are an agronomy assistant. Provide concise, evidence-based guidance. "
-        "If you lack data, state the limitation and ask for what is needed."
+        "You are GenoSense AI — an agricultural crop-science assistant embedded in a "
+        "precision-phenotyping dashboard. You have access to the full experiment CSV below.\n"
+        "\n"
+        "STRICT RESPONSE RULES — follow every rule exactly, no exceptions:\n"
+        "RULE 1 — GENOTYPE QUERIES: If the user asks which genotype is best/worst/highest/lowest "
+        "for ANY trait, look up the data, find the answer, and reply with ONLY:\n"
+        "  'Genotype <number>' (e.g. 'Genotype 47')\n"
+        "  You MAY add one sentence of supporting data (e.g. the exact index value). "
+        "  Do NOT ask for clarification. Do NOT say you cannot determine it. "
+        "  Do NOT suggest uploading more data. Just pick the best one from the CSV.\n"
+        "RULE 2 — VALUE QUERIES: If asked for a specific value (yield, NDVI, etc.), "
+        "return ONLY the number from the CSV. Example: '0.742'\n"
+        "RULE 3 — EXPLANATION QUERIES: If asked what an index MEANS (not a data lookup), "
+        "give a 1-2 sentence definition using the VI Reference below.\n"
+        "RULE 4 — NEVER say 'I cannot determine', 'insufficient data', or 'please upload'. "
+        "The CSV is always provided — use it.\n"
+        "RULE 5 — Keep all answers under 3 sentences unless a table/breakdown is explicitly requested.\n"
+        f"\n{VI_GLOSSARY}"
     )
-    if context:
-        system_prompt += "\n\nContext data:\n" + context
+
+    if data_context:
+        system_prompt += (
+            "\n\n━━ EXPERIMENT DATA (full temporal CSV) ━━\n"
+            "This is the complete dataset. Use it to answer ALL data questions.\n"
+            + data_context
+        )
 
     history = clamp_history(req.history)
-    messages = [{"role": "system", "content": system_prompt}]
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
     messages += [{"role": m.role, "content": m.content} for m in history]
     messages.append({"role": "user", "content": req.message})
 
     response = openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=messages,
-        temperature=0.2,
-        max_tokens=500,
+        temperature=0.0,   # zero temperature = maximally factual / deterministic
+        max_tokens=700,
     )
     reply = response.choices[0].message.content or ""
     return JSONResponse({"reply": reply.strip()})
