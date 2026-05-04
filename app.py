@@ -410,31 +410,38 @@ def auth_signin(payload: SignInRequest) -> JSONResponse:
 
 @app.post("/auth/google-signup")
 def auth_google_signup(payload: GoogleTokenRequest) -> JSONResponse:
-    users = get_users_collection()
-    google_user = _verify_google_token(payload.token)
-
-    email = str(google_user.get("email", "")).strip().lower()
+    user_info = _verify_google_token(payload.token)
+    email = str(user_info.get("email", "")).strip().lower()
     if not email:
         raise HTTPException(status_code=400, detail="Google account email is missing")
 
-    existing_user = users.find_one({"email": email})
-    if existing_user:
+    users = get_users_collection()
+    try:
+        existing = users.find_one({"email": email})
+    except Exception:
+        existing = None
+
+    if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
 
-    name = str(google_user.get("name") or google_user.get("given_name") or "Google User").strip() or "Google User"
     user_doc = {
-        "name": name,
+        "name": str(user_info.get("name", "")).strip(),
         "email": email,
+        "password_hash": "",
         "created_at": datetime.now(tz=timezone.utc).isoformat(),
         "last_processed_files": None,
+        "google_sub": user_info.get("sub"),
     }
 
-    result = users.insert_one(user_doc)
+    try:
+        result = users.insert_one(user_doc)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="Email already registered")
+
     user_id = str(result.inserted_id)
     ensure_user_r2_prefix(user_id)
-    user = users.find_one({"_id": ObjectId(user_id)})
-
     token = create_access_token(user_id, email)
+    user = users.find_one({"_id": ObjectId(user_id)})
     response = JSONResponse({"user": to_public_user(user).model_dump(), "access_token": token})
     response.set_cookie(
         key="access_token",
@@ -449,16 +456,15 @@ def auth_google_signup(payload: GoogleTokenRequest) -> JSONResponse:
 
 @app.post("/auth/google-signin")
 def auth_google_signin(payload: GoogleTokenRequest) -> JSONResponse:
-    users = get_users_collection()
-    google_user = _verify_google_token(payload.token)
-
-    email = str(google_user.get("email", "")).strip().lower()
+    user_info = _verify_google_token(payload.token)
+    email = str(user_info.get("email", "")).strip().lower()
     if not email:
         raise HTTPException(status_code=400, detail="Google account email is missing")
 
+    users = get_users_collection()
     user = users.find_one({"email": email})
     if not user:
-        raise HTTPException(status_code=404, detail="Account not found. Please sign up first")
+        raise HTTPException(status_code=404, detail="User not found")
 
     token = create_access_token(str(user["_id"]), email)
     response = JSONResponse({"user": to_public_user(user).model_dump(), "access_token": token})
